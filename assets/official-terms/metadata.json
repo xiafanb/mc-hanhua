@@ -1,0 +1,9 @@
+{
+  "game_version": "1.21.5",
+  "source": "Mojang Java edition",
+  "version_url": "https://piston-meta.mojang.com/v1/packages/405e2a86530bad6992f832b66a0421fb6a65e5c8/1.21.5.json",
+  "zh_cn_url": "https://resources.download.minecraft.net/6e/6e909a6e69fbc5a1d5e94977f14d79dcff1d1e1e",
+  "client_url": "https://piston-data.mojang.com/v1/objects/b88808bbb3da8d9f453694b5d8f74a3396f1a533/client.jar",
+  "client_sha1": "b88808bbb3da8d9f453694b5d8f74a3396f1a533",
+  "zh_cn_sha1": "6e909a6e69fbc5a1d5e94977f14d79dcff1d1e1e"
+}

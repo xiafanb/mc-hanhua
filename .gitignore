@@ -1,23 +1,99 @@
-### AL ###
-#Template for AL projects for Dynamics 365 Business Central
-#launch.json folder
-.vscode/
-#Cache folder
-.alcache/
-#Symbols folder
-.alpackages/
-#Snapshots folder
-.snapshots/
-#Testing Output folder
-.output/
-#Extension App-file
-*.app
-#Rapid Application Development File
-rad.json
-#Translation Base-file
-*.g.xlf
-#License-files
-*.bclicense
-*.flf
-#Test results file
-TestResults.xml
+# Python tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Packaged application output
+/build/
+/dist/
+*.spec
+
+# Clean snapshot used to push a new GitHub repo (no parent Git history).
+/upload/
+
+# Translation runtime state and diagnostics
+.mc-hanhua/
+.mc-hanhua-cache/
+.mc-hanhua-work-*/
+/logs/
+*.log
+*.sqlite
+
+# Large Minecraft inputs and generated archives
+*.zip
+*.jar
+*.mrpack
+
+# Minecraft binary formats never belong in version control.
+*.mca
+*.dat
+*.dat_old
+*.backup
+
+# Local workspace data: ignore everything by default so new data/ subfolders
+# (sample worlds, audits) cannot be committed by accident; keep only markers
+# and documentation.
+data/*
+!data/README.md
+!data/input/
+data/input/*
+!data/input/.gitkeep
+!data/output/
+data/output/*
+!data/output/.gitkeep
+!data/logs/
+data/logs/*
+!data/logs/.gitkeep
+
+# Mod translation asset library (CFPA sync output and local overlays).
+!data/mod-assets/
+data/mod-assets/*
+!data/mod-assets/README.md
+
+# Local lint and browser automation artifacts (retained on disk)
+.ruff_cache/
+/.playwright-mcp/
+
+# Machine-local agent state, diagnostics and private release-review evidence.
+/.pi/
+/.claude/
+/.agents/
+/.codex/
+/.local/
+
+# Credentials and private configuration (including encrypted key stores).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials.json
+secrets.json
+gui-config.json
+*sslkeys*
+
+# Python environments and package metadata.
+.venv/
+venv/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Runtime exports, database sidecars and Minecraft state.
+*.jsonl
+*.sqlite-*
+*.db
+*.db-*
+*.nbt
+session.lock
+*-translation-report.json
+*-translation-report.html
+*.task.json
+*.exe
+*.dll
+.DS_Store
+Thumbs.db

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebEngine 打包探针</title>
+  <style>
+    :root { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; color: #10243d; background: #f3f7fc; }
+    body { margin: 0; background: #f3f7fc; }
+    main { max-width: 720px; margin: 48px auto; padding: 28px; background: #fff; border: 1px solid #cbdced; border-radius: 13px; }
+    h1 { font-size: 23px; margin: 0 0 12px; }
+    p { color: #69809c; font-size: 14px; line-height: 1.7; }
+    button { font: inherit; cursor: pointer; border: 1px solid #cbdced; background: #f7faff; color: #34536f; border-radius: 7px; padding: 10px 14px; }
+    button:hover { background: #edf6ef; border-color: #94c99e; }
+    pre { background: #fbfdff; border: 1px solid #dce7f1; border-radius: 9px; padding: 12px; font-size: 13px; white-space: pre-wrap; }
+  </style>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+  <main>
+    <h1>WebEngine 打包探针</h1>
+    <p>本页只验证本地 HTML、QWebChannel 与原生文件选择器。不是产品界面。</p>
+    <p>
+      <button id="choose" type="button">选择资源</button>
+      <button id="ping" type="button">发送 ping</button>
+    </p>
+    <pre id="log">等待桥接…</pre>
+  </main>
+  <script>
+    const log = (value) => { document.getElementById("log").textContent = value; };
+    const mark = (suffix) => { document.title = suffix; };
+    new QWebChannel(qt.webChannelTransport, (channel) => {
+      const backend = channel.objects.backend;
+      window.backend = backend;
+      backend.ping("probe-ready", (reply) => {
+        log("桥接就绪\n" + reply);
+        mark("PROBE_READY");
+      });
+      document.getElementById("ping").onclick = () => {
+        backend.ping("manual-ping", log);
+      };
+      document.getElementById("choose").onclick = () => {
+        backend.choose_resource("manual-choose", log);
+      };
+    });
+  </script>
+</body>
+</html>

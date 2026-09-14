@@ -1,0 +1,21 @@
+# Normalize line endings: text files are stored with LF; Windows checkouts
+# keep working-tree CRLF only where tools require it.
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf
+
+# Never run text conversion on binary payloads.
+*.mca binary
+*.dat binary
+*.dat_old binary
+*.backup binary
+*.nbt binary
+*.ttf binary
+*.png binary
+*.ico binary
+*.zip binary
+*.jar binary
+*.mrpack binary
+*.sqlite binary
