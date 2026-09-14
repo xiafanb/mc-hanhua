@@ -46,38 +46,35 @@
 
 ## 怎么用
 
-### 打开程序
+### 打包 exe
 
-如果已经有 `mc汉化器.exe`，双击运行即可。
-
-还没有现成程序时，在 Windows 上用 Python 3.11 或更高版本启动：
+一次打包，到处双击。需要 Windows 和 Python 3.11+：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[gui]"
-python scripts/gui_entry.py
+python -m pip install -e ".[gui,packaging]"
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
 
-### 汉化一份资源
+打好的程序在 `dist\mc汉化器.exe`，拷到别的电脑也能直接用，不再需要 Python。
 
-1. **选择输入**  
-   拖入或点选原始的 zip / jar / mrpack，或地图、整合包文件夹。
-2. **确认输出位置**  
-   默认会在旁边生成新文件。请留着原始包，不要覆盖唯一底稿。
-3. **填写连接**  
-   打开「连接控制」，填入兼容 ChatGPT / OpenAI 格式的接口地址、密钥和模型。可以先测连接。
-4. **开始**  
-   不确定范围时，先点「仅扫描预览」；确认后再点「开始汉化」。
-5. **检查结果**  
-   看报告里哪些已经写成中文、哪些被保护没动、哪些还空着。然后进游戏抽查出生点、书、告示牌和提示文字。
+不想打包的话，装好依赖后跑 `python scripts/gui_entry.py` 也能直接启动。
+
+### 汉化一张地图
+
+1. 把 zip / jar / mrpack 或地图文件夹拖进去
+2. 在「连接控制」里填上 AI 接口地址、密钥和模型
+3. 点「开始汉化」，等进度走完
+4. 进游戏翻翻告示牌、书和对话，看译得顺不顺
+
+放心折腾：程序只改副本，你的原件动都不动。拿不准就先点「仅扫描预览」，看看会译哪些再开始。
 
 <p align="center">
   <img src="design/lianjiekongzhi .png" alt="连接控制：填写接口、模型和并发" width="520">
 </p>
 
-
-进度走完，只表示这一轮处理结束，**不表示每一句都已译成中文**。可以在翻译结束后查看扫描预览确定翻译的内容，在问题审阅处查看未处理/无法处理的问题
+进度走完 ≠ 全部译完。哪些没译、为什么没译，报告里都写得明明白白。
 
 ## 使用前请知道
 
