@@ -8,7 +8,8 @@ import shutil
 import tempfile
 import zipfile
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import asdict
 from pathlib import Path
 from threading import Event
 
@@ -34,17 +35,17 @@ from .official_terms import OfficialTermIndex
 from .plugins import PluginRegistry
 from .policy import POLICY_IMMUTABLE_ID, POLICY_IMMUTABLE_MATCH, POLICY_TRANSLATABLE, POLICY_UNKNOWN, apply_unit_policy, should_send_to_ai
 from .quality import (
+    MEMORY_DB_FILENAME,
     build_translation_groups,
     estimate_group_requests,
-    is_multiline_layout_unit,
     quality_memory_context,
     unit_outcome_status,
     validate_contextual_target,
 )
 from .reporting import write_html_report, write_json_report
-from .task_records import archive_fingerprint, atomic_write_json
+from .task_records import archive_fingerprint, atomic_write_json, task_input_fingerprint
 from .translator import STOPPED_MESSAGE, TranslationPaused, TranslatorProvider, translator_from_env
-from .utils import looks_like_chinese_translation, normalize_layout_newlines
+from .utils import UNREADABLE_TEXT_ERRORS, is_os_metadata_path, looks_like_chinese_translation, stable_id
 
 ProgressCallback = Callable[[ProgressEvent], None]
 SeedTranslations = dict[tuple[str, str, str, str], str]
@@ -60,10 +61,165 @@ def _emit(
     stage: str,
     message: str,
     percent: int,
+    progress: TaskProgress | None = None,
     **stats: object,
 ) -> None:
-    if callback:
-        callback(ProgressEvent(stage=stage, message=message, percent=max(0, min(100, percent)), **stats))
+    """Emit one progress event, optionally carrying a full counter snapshot.
+
+    When ``progress`` is given, the event describes the whole task rather than
+    just the current work item. The UI rebuilds every card from each snapshot,
+    so an event missing a counter *resets* that card; carrying the complete set
+    is what keeps the numbers stable. Explicitly passed stats win, which lets a
+    caller override a single field without dropping the rest.
+    """
+
+    if not callback:
+        return
+    if progress is not None:
+        merged: dict[str, object] = progress.snapshot()
+        merged.update(stats)
+        stats = merged
+    callback(ProgressEvent(stage=stage, message=message, percent=max(0, min(100, percent)), **stats))
+
+
+class TaskProgress:
+    """Authoritative task-wide progress, aggregated across root and nested work.
+
+    Two properties the UI depends on:
+
+    * every emitted snapshot is *complete* — core counters are always present
+      numbers starting at 0, so a card can never be reset by an event that
+      merely omits a field;
+    * the "translated" figure is measured by folding units in **by identity**,
+      so it follows the same rule as the final report (final text differs from
+      the source, whoever produced it) and is *allowed to fall* when write-back
+      reverts a candidate. Hiding a fall behind a maximum would keep a number
+      that is no longer true.
+
+    Units are folded at stage boundaries — once after the reuse pass, once per
+    AI group checkpoint, once after write-back — never by re-scanning every unit
+    for every event.
+    """
+
+    def __init__(self) -> None:
+        self.scanned_total = 0
+        self.units_total = 0
+        self.groups_total = 0
+        self.groups_discovered = 0
+        self.groups_done = 0
+        self.archives_discovered = 0
+        self.archive_index = 0
+        self.local_scanned = 0
+        self.local_groups_total = 0
+        self.local_groups_completed = 0
+        self.units_translated = 0
+        self.units_original_preserved = 0
+        self._translated: dict[str, bool] = {}
+
+    def observe(self, units: Iterable[TextUnit]) -> None:
+        """Fold the current state of these units in, once per unit identity.
+
+        The two counters partition the units seen so far, so a unit only moves
+        between them — it never contributes to both. The first observation of a
+        unit therefore establishes its side; later ones may switch it, which is
+        how a write-back revert lowers the translated count.
+        """
+
+        for unit in units:
+            now_translated = unit.final_target not in (None, unit.source_text)
+            previous = self._translated.get(unit.id)
+            if previous == now_translated:
+                continue
+            self._translated[unit.id] = now_translated
+            if now_translated:
+                self.units_translated += 1
+                if previous is not None:
+                    self.units_original_preserved -= 1
+            else:
+                self.units_original_preserved += 1
+                if previous is not None:
+                    self.units_translated -= 1
+
+    def begin_scanned(self, units: int) -> None:
+        """A package's units have been discovered."""
+
+        self.scanned_total += units
+        self.units_total += units
+        self.local_scanned = units
+
+    def begin_groups(self, total: int) -> None:
+        self.groups_total += total
+        self.groups_discovered = self.groups_total
+        self.local_groups_total = total
+        self.local_groups_completed = 0
+
+    def mark_groups(self, done: int) -> None:
+        """Set this package's completed-group count (it can lag the total)."""
+
+        delta = done - self.local_groups_completed
+        if delta > 0:
+            self.groups_done += delta
+        self.local_groups_completed = done
+
+    def snapshot(self) -> dict[str, object]:
+        """Complete counter set for a progress event."""
+
+        return {
+            "scanned": self.scanned_total,
+            "scanned_total": self.scanned_total,
+            "units_total": self.units_total,
+            "units_translated": self.units_translated,
+            "units_original_preserved": self.units_original_preserved,
+            "groups_total": self.groups_total,
+            "groups_discovered": self.groups_discovered,
+            "groups_done": self.groups_done,
+            # Per-package figures are reported separately so the UI can say
+            # "this package: 3/4" without ever overwriting the task total.
+            "local_scanned": self.local_scanned,
+            "local_groups_total": self.local_groups_total,
+            "local_groups_completed": self.local_groups_completed,
+            "archive_index": self.archive_index,
+            "archives_discovered": self.archives_discovered,
+        }
+
+
+def _report_progress_stats(report: TranslationReport) -> dict[str, object]:
+    """Canonical counters for events emitted after the run (pack / save / complete).
+
+    By that point the task counters are gone, and an event carrying only
+    ``translated`` would reset the cards: the terminal events are the ones the UI
+    keeps. The report holds the same figures, measured the same way.
+    """
+
+    return {
+        "scanned": report.scanned,
+        "scanned_total": report.scanned,
+        "units_total": report.units_total,
+        "units_translated": report.units_translated,
+        "units_original_preserved": report.units_original_preserved,
+        "units_validation_failed": report.units_validation_failed,
+        "units_writeback_failed": report.units_writeback_failed,
+        "groups_total": report.groups_total,
+        "groups_discovered": report.groups_total,
+        "groups_done": report.groups_completed,
+        "local_groups_total": report.groups_total,
+        "local_groups_completed": report.groups_completed,
+        "translated": report.translated,
+        "reused": report.reused,
+        "skipped": report.skipped,
+        "failure_counts": report.failure_counts,
+        "retry_counts": report.retry_counts,
+    }
+
+
+def _progress_stats(event: ProgressEvent | None) -> dict[str, object]:
+    if event is None:
+        return {}
+    return {
+        key: value
+        for key, value in asdict(event).items()
+        if key not in {"stage", "message", "percent", "last_error"}
+    }
 
 
 def _safe_archive_id(archive_rel: str) -> str:
@@ -72,6 +228,22 @@ def _safe_archive_id(archive_rel: str) -> str:
     # keeps every archive's staging directory distinct.
     digest = hashlib.sha256(archive_rel.encode("utf-8")).hexdigest()[:12]
     return f"{sanitized}-{digest}"
+
+
+def _mark_archive_identity(units: list[TextUnit], archive_rel: str) -> None:
+    """Tag units with the nested archive they came from.
+
+    Must run *before* any translation: ``quality_memory_context`` namespaces a
+    unit's memory key by ``archive_chain``, and only when it is already present.
+    Setting it after translation let two different JARs in one pack share a
+    single key, so the second one was answered from the first one's translation
+    with no request at all. Paths are deliberately left untouched here —
+    seed/manual lookups run against the un-prefixed in-archive path.
+    """
+
+    for unit in units:
+        unit.metadata["archive_id"] = archive_rel
+        unit.metadata["archive_chain"] = [archive_rel]
 
 
 def _prefix_units(units: list[TextUnit], archive_rel: str) -> None:
@@ -267,7 +439,14 @@ def _check_cancel(cancel_event: Event | None) -> None:
         raise TranslationPaused(STOPPED_MESSAGE)
 
 
-def scan(root: Path, registry: PluginRegistry | None = None, cancel_event: Event | None = None, *, allow_new_names: bool = True) -> ScanResult:
+def scan(
+    root: Path,
+    registry: PluginRegistry | None = None,
+    cancel_event: Event | None = None,
+    *,
+    allow_new_names: bool = True,
+    input_fingerprint: str = "",
+) -> ScanResult:
     registry = registry or default_registry()
     result = ScanResult(root=root)
     selector_refs: set[str] = set()
@@ -276,6 +455,11 @@ def scan(root: Path, registry: PluginRegistry | None = None, cancel_event: Event
     mechanism_refs: set[str] = set()
     for path in iter_files(root):
         _check_cancel(cancel_event)
+        if is_os_metadata_path(path):
+            # macOS resource forks carry no game text; reading them only
+            # produced "unparseable" warnings. They are still copied to the
+            # output untouched.
+            continue
         plugin = registry.extractor_for(path)
         if not plugin:
             continue
@@ -288,6 +472,7 @@ def scan(root: Path, registry: PluginRegistry | None = None, cancel_event: Event
         mechanism_refs.update(getattr(plugin, "last_mechanism_refs", set()))
         result.commands.extend(getattr(plugin, "last_commands", []))
         result.warnings.extend(getattr(plugin, "last_warnings", []))
+        result.infos.extend(getattr(plugin, "last_infos", []))
         per_file = getattr(plugin, "last_filtered_counts", {})
         if per_file:
             result.file_filtered[path.relative_to(root).as_posix()] = dict(per_file)
@@ -298,9 +483,12 @@ def scan(root: Path, registry: PluginRegistry | None = None, cancel_event: Event
             remaining = filter_detail_limit() - len(result.filtered_details)
             if remaining > 0:
                 result.filtered_details.extend(details[:remaining])
+        result.fragment_candidates.extend(getattr(plugin, "last_fragment_candidates", []) or [])
     result.mechanism_refs = mechanism_refs
     for unit in result.text_units:
         apply_unit_policy(unit)
+    _lock_mechanism_function_arguments(result, input_fingerprint)
+    _promote_and_stamp_fragments(result, input_fingerprint)
     identity_hits = _identity_hits(result, selector_refs, player_names, custom_names)
     from .references import apply_index_to_units, build_reference_index
 
@@ -318,7 +506,146 @@ def scan(root: Path, registry: PluginRegistry | None = None, cancel_event: Event
     _finalize_entity_display_names(result, selector_refs, mechanism_refs, index)
     apply_index_to_units(result, index)
     _sync_immutable_mechanism_refs(result)
+    result.filtered_detail_total = max(len(result.filtered_details), sum(result.filtered_counts.values()))
     return result
+
+
+def _lock_mechanism_function_arguments(result: ScanResult, input_fingerprint: str) -> None:
+    """Lock values fed to function parameters the callee does not display.
+
+    A ``function demo:foo {mode:"all"}`` value ends up somewhere in ``demo:foo``:
+    in a display sink (the value is shown, so it may be translated) or in an
+    identifier / selector / command position (translating it breaks the map).
+    ``purpose_index`` proves which from the package itself; anything it cannot
+    prove stays mechanism. Locking happens once, here, so folders, archives,
+    nested packages and the recovery re-audit share one rule.
+
+    The reviewed exception table can promote an *unproven* argument to display;
+    it can never override a proven mechanism verdict.
+    """
+
+    from .purpose_index import argument_for_unit, build_index, load_display_argument_allowlist
+
+    candidates = [
+        unit
+        for unit in result.text_units
+        if unit.file_path.lower().endswith(".mcfunction") and unit.format == "mcfunction"
+    ]
+    if not candidates:
+        return
+    index = None
+    allowlist = None
+    lines: dict[str, list[str]] = {}
+    locked = 0
+    for unit in candidates:
+        line = _unit_line_text(result.root, unit, lines)
+        if line is None:
+            continue
+        if index is None:
+            index = build_index(result.root)
+            allowlist = load_display_argument_allowlist()
+        decision = argument_for_unit(unit, line, index, allowlist=allowlist, fingerprint=input_fingerprint)
+        if decision is None or decision.translatable:
+            continue
+        locked += 1
+        unit.policy = POLICY_IMMUTABLE_MATCH
+        unit.policy_reason = f"函数实参不是显示用途（{decision.function} 的 {decision.argument}：{decision.verdict}）"
+        unit.metadata["function_argument"] = {
+            "function": decision.function,
+            "argument": decision.argument,
+            "verdict": decision.verdict,
+            "source": decision.source,
+        }
+        unit.object_key = unit.object_key or f"match:function_argument:{decision.function}:{decision.argument}"
+        _append_lock_detail(result, unit, "function_argument_locked", unit.policy_reason)
+    if locked:
+        result.filtered_counts["function_argument_locked"] = result.filtered_counts.get("function_argument_locked", 0) + locked
+
+
+def _promote_and_stamp_fragments(result: ScanResult, input_fingerprint: str) -> None:
+    """Promote reviewed short fragments to units, then stamp the reviewed drops.
+
+    Two steps, both table-driven by (input fingerprint, production file path,
+    exact locator):
+
+    1. display leaves that ``looks_translatable`` refuses (a bare ``a``/``I``
+       between two real display leaves of the same command payload) become
+       units **only** when the reviewed table names them, so the model can see
+       the sentence instead of leaving a stray English word;
+    2. already-extracted fragments (the ``"\\nThe "`` class) get the drop
+       permission stamped on them.
+
+    Nothing else changes: policy, the write door and the audit stay as they are.
+    """
+
+    from .quality import fragment_shape_ok, load_fragment_merge_allowlist, stamp_fragment_merges
+
+    allowlist = load_fragment_merge_allowlist()
+    if not allowlist.entries:
+        return
+    promoted = 0
+    by_file: dict[str, set[str]] = {}
+    for unit in result.text_units:
+        by_file.setdefault(unit.file_path, set()).add(unit.locator)
+    for candidate in result.fragment_candidates:
+        entry = allowlist.entry_for(input_fingerprint, candidate.get("file_path", ""), str(candidate.get("locator") or ""))
+        if entry is None:
+            continue
+        source = str(entry.get("source") or "")
+        if source != str(candidate.get("text") or "") or not fragment_shape_ok(source):
+            continue
+        passage = [str(part) for part in entry.get("passage") or [] if isinstance(part, str)]
+        others = [part for part in passage if part != candidate["locator"]]
+        if not others or not set(others) <= by_file.get(candidate["file_path"], set()):
+            continue
+        unit = apply_unit_policy(
+            TextUnit(
+                id=stable_id(candidate["file_path"], candidate["locator"], source),
+                source_text=source,
+                file_path=candidate["file_path"],
+                format="mcfunction",
+                locator=str(candidate["locator"]),
+                context=f"fragment:{source.strip()}",
+                risk_level=RiskLevel.MEDIUM,
+            )
+        )
+        if unit.policy != POLICY_TRANSLATABLE:
+            continue
+        unit.metadata["fragment_merge"] = {
+            "source": source,
+            "passage": passage,
+            "reason": str(entry.get("reason") or ""),
+            "evidence": str(entry.get("evidence") or ""),
+            "promoted": True,
+        }
+        result.text_units.append(unit)
+        by_file.setdefault(unit.file_path, set()).add(unit.locator)
+        promoted += 1
+    stamped = stamp_fragment_merges(result.text_units, input_fingerprint, allowlist)
+    if promoted:
+        result.filtered_counts["fragment_promoted"] = result.filtered_counts.get("fragment_promoted", 0) + promoted
+    if stamped:
+        result.filtered_counts["fragment_merge_allowlisted"] = result.filtered_counts.get("fragment_merge_allowlisted", 0) + stamped
+
+
+def _unit_line_text(root: Path, unit: TextUnit, cache: dict[str, list[str]]) -> str | None:
+    """The scanned line a unit sits on, read once per file."""
+
+    path = root / unit.file_path
+    if unit.file_path not in cache:
+        try:
+            cache[unit.file_path] = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            cache[unit.file_path] = []
+    lines = cache[unit.file_path]
+    try:
+        locator = json.loads(unit.locator)
+    except (TypeError, ValueError):
+        return None
+    line_number = locator.get("line") if isinstance(locator, dict) else None
+    if not isinstance(line_number, int) or not (0 <= line_number < len(lines)):
+        return None
+    return lines[line_number]
 
 
 def _sync_immutable_mechanism_refs(result: ScanResult) -> None:
@@ -695,7 +1022,7 @@ def load_existing_zh_cn_glossary(root: Path) -> Glossary:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
+        except UNREADABLE_TEXT_ERRORS:
             continue
         if isinstance(data, dict) and path.stem in {"en_us", "zh_cn"}:
             pack_key = path.parent.parent.as_posix()
@@ -743,14 +1070,6 @@ def _lookup_book_locator_alias(memory: TranslationMemory, unit: TextUnit, memory
     return memory.get(unit.source_text, alias)
 
 
-def _normalize_layout_target(unit: TextUnit, target: str) -> str:
-    """Repair escaped breaks only for proven multiline display containers."""
-
-    if is_multiline_layout_unit(unit):
-        return normalize_layout_newlines(unit.source_text, target)
-    return target
-
-
 def _validated_candidate(
     unit: TextUnit,
     candidate: object,
@@ -758,34 +1077,20 @@ def _validated_candidate(
     origin: str,
     official_terms: OfficialTermIndex | None = None,
 ) -> str | None:
-    """Normalize and validate every reusable/model candidate at one gate."""
+    """Normalize and validate every reusable/model candidate at one gate.
 
-    if not isinstance(candidate, str):
-        reason = "invalid_candidate_type"
-        normalized = None
-    else:
-        from .quality import is_book_page_unit
+    The candidate itself is judged by ``quality.validate_reuse`` — the single
+    place that decides whether a stored, shared or generated target may serve the
+    *current* input span. This wrapper only adds the policy layer that needs the
+    official-term index and emits the rejection event.
+    """
 
-        if is_book_page_unit(unit) and not re.match(r"^\s*\[page=", unit.source_text):
-            # Prompt page labels are context, never part of the displayed page.
-            candidate = re.sub(r"^\s*\[page=(?:\d+|未知)\][ \t]*", "", candidate)
-        normalized = _normalize_layout_target(unit, candidate)
-        # A proven TextDisplay renders real line breaks, but the map may author
-        # them as literal "\n" sequences that the game only shows as backslash-n
-        # and no model reproduces reliably. Convert both sides for proven
-        # text-display containers only; commands and language files keep their
-        # literal tokens (README: 布局容器限定).
-        if unit.metadata.get("layout_container") == "text-display" and "\\n" in unit.source_text:
-            normalized = normalized.replace("\\n", "\n")
-            source_for_validation = unit.source_text.replace("\\n", "\n")
-        else:
-            source_for_validation = unit.source_text
-        reason = validate_contextual_target(source_for_validation, normalized)
-        if reason is None and _reuse_conflicts_official(unit, normalized, official_terms):
-            reason = "official_term_conflict"
-        layout_slot = unit.metadata.get("layout_container") in {"sign", "text-display"}
-        if reason is None and not normalized.strip() and unit.source_text.strip() and not layout_slot:
-            reason = "empty_candidate"
+    from .quality import INTENTIONAL_KEEP, validate_reuse
+
+    result = validate_reuse(unit, candidate)
+    normalized, reason = result.normalized, result.reason
+    if reason is None and normalized is not None and _reuse_conflicts_official(unit, normalized, official_terms):
+        reason = "official_term_conflict"
     if reason is not None:
         unit.metadata["candidate_validation"] = {"origin": origin, "reason": reason}
         emit_event(
@@ -803,8 +1108,10 @@ def _validated_candidate(
         )
         return None
     # A stale rejection from an earlier attempt must not outlive a success
-    # and pollute the final outcome stats (A14).
+    # and pollute the final outcome stats (A14).  The same holds for a keep the
+    # provider decided in an earlier pass: this unit now has a real candidate.
     unit.metadata.pop("candidate_validation", None)
+    unit.metadata.pop(INTENTIONAL_KEEP, None)
     return normalized
 
 
@@ -814,7 +1121,19 @@ def load_prior_translation_seeds(
     *,
     fallback_dirs: tuple[Path, ...] = (),
 ) -> SeedTranslations:
-    """Load exact-input drafts from the current report store and legacy stores."""
+    """Load drafts from the current report store, for this exact input version.
+
+    A report only seeds a later run when it describes the same input *content*.
+    Matching on ``input_path`` alone let a replaced map file (new version, same
+    path) import the previous version's translations — the same leak the memory
+    namespace closes, reached through a different door (B3). Reports written
+    before the fingerprint existed carry no identity and are therefore skipped:
+    the conservative branch, since their provenance cannot be established.
+    """
+
+    expected = task_input_fingerprint(input_path) if input_path.exists() else ""
+    if not expected:
+        return {}
 
     candidates: list[tuple[float, Path, dict[str, object]]] = []
     seen_dirs: set[Path] = set()
@@ -828,6 +1147,8 @@ def load_prior_translation_seeds(
                 payload = json.loads(report_path.read_text(encoding="utf-8"))
                 report = payload.get("report", {})
                 if not isinstance(report, dict) or Path(str(report.get("input_path", ""))).resolve() != input_path.resolve():
+                    continue
+                if str(report.get("input_fingerprint") or "") != expected:
                     continue
                 units = payload.get("units", [])
                 if not isinstance(units, list) or not any(
@@ -879,7 +1200,7 @@ def _resolve_mod_assets(mod_assets: ModAssetLibrary | Path | None) -> ModAssetLi
 def _load_language_entries(path: Path) -> dict[str, object] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
+    except UNREADABLE_TEXT_ERRORS:
         return None
     return value if isinstance(value, dict) else None
 
@@ -1042,6 +1363,7 @@ def _apply_seed_targets(units: list[TextUnit], seeds: SeedTranslations) -> None:
 
 
 def _apply_desktop_choices(units, skip_keys, manual_targets, *, prefix="", official_terms=None, translate_npc: bool = True):
+    from .quality import validate_reuse
     from .task_records import unit_key
     for unit in units:
         key = unit_key([], prefix + unit.file_path, unit.format, unit.locator, unit.source_text)
@@ -1053,10 +1375,22 @@ def _apply_desktop_choices(units, skip_keys, manual_targets, *, prefix="", offic
             target = manual_targets[key]
             if not should_send_to_ai(unit.policy):
                 raise ValueError("修订对象已被机制保护，不能应用")
-            reason = validate_contextual_target(unit.source_text, target)
-            if not target.strip() or reason or _reuse_conflicts_official(unit, target, official_terms):
+            # A human revision is a reuse path like any other: it must satisfy the
+            # current grammar for the current span, and it may not blank a slot
+            # (clearing text is expressed by skipping the unit, not by an empty
+            # revision).
+            result = validate_reuse(unit, target, allow_layout_slot=False)
+            normalized, reason = result.normalized, result.reason
+            if reason is None and _reuse_conflicts_official(unit, normalized or "", official_terms):
+                reason = "official_term_conflict"
+            if normalized is None or reason is not None:
                 raise ValueError(f"修订校验失败：{reason or '术语冲突或空译文'}")
-            unit.final_target = target
+            unit.final_target = normalized
+            # A reviewed human revision outranks machine output: the consistency
+            # unifier may not overwrite it, and it becomes the canonical value
+            # of its same-source group unless the group holds a competing
+            # revision (then each context keeps its own wording).
+            unit.metadata["desktop_revision"] = True
 
 
 def _resolve_official_terms(
@@ -1070,6 +1404,19 @@ def _resolve_official_terms(
         return OfficialTermIndex.from_directory(official_terms_dir, official_terms_version or "")
     from .official_terms import bundled_official_terms
     return bundled_official_terms()
+
+
+def _official_targets_by_key(index: OfficialTermIndex | None) -> dict[str, str] | None:
+    """Official Simplified-Chinese text per language key, or None if unavailable.
+
+    The audit needs it to tell a legitimate localization of a value ("None" ->
+    "无", which is vanilla's own wording) from a rewritten mechanism value. No
+    baseline means no verdict, so the caller's behaviour stays as before.
+    """
+
+    if index is None or not index.available:
+        return None
+    return {term.key: term.target for term in index.terms}
 
 
 def _official_role_for_unit(unit: TextUnit) -> str | None:
@@ -1098,6 +1445,7 @@ def translate_units(
     seed_translations: SeedTranslations | None = None,
     cancel_event: Event | None = None,
     official_terms: OfficialTermIndex | None = None,
+    progress: TaskProgress | None = None,
 ) -> tuple[int, int, int]:
     translated = 0
     reused = 0
@@ -1185,20 +1533,33 @@ def translate_units(
         ai_groups = groups if max_ai is None else groups[:max_ai]
         scheduled_ids = {unit.id for group in ai_groups for unit in group.units}
         ai_total = len(ai_groups)
-        planned_draft_calls, planned_review_calls = estimate_group_requests(ai_groups)
+        # Ask the provider how it will translate, rather than assuming the chat
+        # shape: a dedicated MT provider issues one request per unit and never
+        # reviews, so a hard-coded estimate would be wrong before the run starts.
+        plan = getattr(translator, "plan_requests", None)
+        if callable(plan):
+            planned_draft_calls, planned_review_calls = plan(ai_groups)
+        else:
+            planned_draft_calls, planned_review_calls = estimate_group_requests(ai_groups)
         checkpointed_groups = 0
         seeded_drafts = sum(1 for unit in leaders if unit.suggested_target is not None)
         if hasattr(translator, "seeded_drafts"):
             translator.seeded_drafts += seeded_drafts
 
+        if progress is not None:
+            # Reuse (official / memory / glossary / seeded drafts) has already
+            # decided most units; fold them in once, before any group event, so
+            # the count starts truthful instead of climbing from zero.
+            progress.observe(units)
+            progress.begin_groups(ai_total)
         _emit(
             progress_callback,
             "plan",
             f"已生成 {ai_total} 个上下文文本组",
             progress_start,
+            progress,
             scanned=scanned,
             reused=reused,
-            groups_total=ai_total,
             planned_draft_calls=planned_draft_calls,
             planned_review_calls=planned_review_calls,
             seeded_drafts=seeded_drafts,
@@ -1298,11 +1659,34 @@ def translate_units(
                 percent,
                 current_file=group.file_path,
                 message_html=html_block,
+                # Per-group log lines carry the running counters too: the
+                # frontend replaces every stat card from each snapshot, so
+                # omitting them resets the "已翻译文本" card to 0 until the
+                # next progress tick arrives.
+                scanned=scanned,
+                translated=translated,
+                reused=reused,
+                skipped=skipped,
+                ai_total=ai_total,
+                ai_done=done,
+                progress=progress,
+                units_total=len(units),
+                units_translated=translated,
+                failure_counts=dict(getattr(translator, "failure_counts", {})),
+                retry_counts=dict(getattr(translator, "retry_counts", {})),
+                units_original_preserved=int(getattr(translator, "units_original_preserved", 0)),
+                units_validation_failed=int(getattr(translator, "units_validation_failed", 0)),
+                api_requests=int(getattr(translator, "api_requests", 0)),
+                last_attempt_ms=int(getattr(translator, "last_attempt_ms", 0)),
+                avg_response_ms=int(getattr(translator, "avg_response_ms", 0)),
+                responded_requests=int(getattr(translator, "responded_requests", 0)),
             )
+
+        processed_groups = 0
 
         def checkpoint_group(group, targets: dict[str, str]) -> None:
             _log_ai_result(group, targets, int(getattr(translator, "groups_completed", 0)) + 1)
-            nonlocal translated, reused, checkpointed_groups
+            nonlocal translated, reused, checkpointed_groups, processed_groups
             history_reuse = group.review_only and not group.requires_review
             valid_completed = 0
             for unit in group.units:
@@ -1314,7 +1698,11 @@ def translate_units(
                     continue
                 if target == unit.source_text:
                     # A fallback-preserved original is not a translation (A07):
-                    # caching it would block the retry on every later run.
+                    # caching it would block the retry on every later run.  A
+                    # source the provider kept on purpose already carries the
+                    # ``intentional_keep`` marker (set where the decision was
+                    # made), so the report counts it as a deliberate keep; a unit
+                    # whose provider returned nothing stays ``pending``.
                     continue
                 normalized = _validated_candidate(unit, target, origin="model-checkpoint", official_terms=official_terms)
                 if normalized is None:
@@ -1329,6 +1717,13 @@ def translate_units(
                     translated += 1
             if valid_completed == len(group.units):
                 checkpointed_groups += 1
+            if progress is not None:
+                # Fold this group's outcomes in now. Identity-keyed, so a unit
+                # accepted here and reverted later at write-back decreases the
+                # count rather than leaving a stale "translated".
+                progress.observe(group.units)
+                processed_groups += 1
+                progress.mark_groups(processed_groups)
 
         def on_ai_progress(done: int, total: int, failed: int, last_error: str, group) -> None:
             percent = progress_end if total == 0 else progress_start + int((progress_end - progress_start) * done / total)
@@ -1352,8 +1747,7 @@ def translate_units(
                 units_translated=translated,
                 units_original_preserved=int(getattr(translator, "units_original_preserved", 0)),
                 units_validation_failed=int(getattr(translator, "units_validation_failed", 0)),
-                groups_total=total,
-                groups_done=done,
+                progress=progress,
                 reviewed_groups=int(getattr(translator, "reviewed_groups", 0)),
                 review_corrected=int(getattr(translator, "review_corrected", 0)),
                 planned_draft_calls=int(getattr(translator, "planned_draft_calls", planned_draft_calls)),
@@ -1365,6 +1759,11 @@ def translate_units(
                 rate_limit_cooldowns=int(getattr(translator, "rate_limit_cooldowns", 0)),
                 checkpointed_groups=checkpointed_groups,
                 seeded_drafts=int(getattr(translator, "seeded_drafts", seeded_drafts)),
+                terms_injected=int(getattr(translator, "terms_injected", 0)),
+                terms_hit=int(getattr(translator, "terms_hit", 0)),
+                last_attempt_ms=int(getattr(translator, "last_attempt_ms", 0)),
+                avg_response_ms=int(getattr(translator, "avg_response_ms", 0)),
+                responded_requests=int(getattr(translator, "responded_requests", 0)),
             )
 
         try:
@@ -1387,6 +1786,8 @@ def translate_units(
             if target is not None and unit.final_target is None:
                 if target == unit.source_text:
                     # Fallback-preserved original: never apply or cache (A07).
+                    # A keep the provider decided on purpose already carries the
+                    # ``intentional_keep`` marker; the outcome account reads it.
                     skipped += 1
                     continue
                 normalized = _validated_candidate(unit, target, origin="model", official_terms=official_terms)
@@ -1399,6 +1800,50 @@ def translate_units(
                     skipped += 1
             elif unit.final_target is None:
                 skipped += 1
+    # Tail pass (W7): transport failures get one more batch after the main run,
+    # when the service has had time to recover. Exactly one round, and skipped
+    # for cost-capped runs (max_ai) so a limited run stays limited.
+    if max_ai is None:
+        retry_units = [
+            unit
+            for unit in units
+            if unit.final_target is None and unit.metadata.get("translation_status") == "request_failed"
+        ]
+        if retry_units:
+            _check_cancel(cancel_event)
+            _emit(
+                progress_callback,
+                "ai",
+                f"补跑 {len(retry_units)} 条请求失败的文本",
+                progress_end,
+                progress,
+                scanned=scanned,
+                reused=reused,
+            )
+            retry_targets: dict[str, str] = {}
+            try:
+                retry_targets = translator.translate_groups(build_translation_groups(retry_units), glossary)
+            except TranslationPaused:
+                raise
+            except Exception as exc:  # a failed tail pass never fails the run
+                translator.failure_counts["tail_pass_failed"] = translator.failure_counts.get("tail_pass_failed", 0) + 1
+                translator.failure_samples.setdefault("tail_pass_failed", f"{type(exc).__name__}: {exc}")
+            for unit in retry_units:
+                target = retry_targets.get(unit.id)
+                if target is None or target == unit.source_text:
+                    unit.metadata.pop("translation_status", None)
+                    continue
+                normalized = _validated_candidate(unit, target, origin="model-retry", official_terms=official_terms)
+                if normalized is None:
+                    unit.metadata.pop("translation_status", None)
+                    continue
+                unit.final_target = normalized
+                unit.metadata.pop("translation_status", None)
+                memory.put(unit.source_text, normalized, quality_memory_context(unit), translator.name)
+                translated += 1
+            if progress is not None:
+                progress.observe(units)
+
     applied, leader_conflicts = apply_leader_targets(units)
     reused += applied
     for unit in followers:
@@ -1416,9 +1861,16 @@ def translate_units(
     unified, conflicts = _unify_same_source_targets(units, memory, glossary)
     canonical_conflicts = audit_canonical_consistency(units)
     translator.consistency_unified = int(getattr(translator, "consistency_unified", 0)) + unified + applied
+    # Accumulate instead of replacing: translate_units runs once per nested
+    # archive, and the last call used to erase the root world's findings
+    # (unified already accumulated, so the two counters disagreed).
     merged_conflicts = _merge_conflict_lists(conflicts, leader_conflicts, canonical_conflicts)
-    translator.consistency_conflicts = merged_conflicts
-    translator.canonical_conflicts = canonical_conflicts
+    translator.consistency_conflicts = _merge_conflict_lists(
+        list(getattr(translator, "consistency_conflicts", [])), merged_conflicts
+    )
+    translator.canonical_conflicts = _merge_conflict_lists(
+        list(getattr(translator, "canonical_conflicts", [])), canonical_conflicts
+    )
     return translated, reused, skipped
 
 
@@ -1453,10 +1905,15 @@ def _unify_same_source_targets(
         if policy_blocks_canonical_share(unit):
             keep_original_target(unit)
             continue
-        if not unit.final_target or unit.metadata.get("layout_container"):
+        if not unit.final_target:
             continue
-        if is_shareable_canonical(unit) or glossary.has_entry(unit.source_text):
-            by_key[unit.canonical_key].append(unit)
+        # Layout containers (sign / TextDisplay slots) keep their own canonical
+        # key so slot reflow is never shared. They are still indexed by source,
+        # because a name the user pinned in the glossary must not read two ways
+        # on a sign and in a command (real map: NORTHWALK CITY vs Northwalk city).
+        if not unit.metadata.get("layout_container"):
+            if is_shareable_canonical(unit) or glossary.has_entry(unit.source_text):
+                by_key[unit.canonical_key].append(unit)
         by_source[unit.source_text].append(unit)
     unified = 0
     conflicts: dict[str, dict[str, object]] = {}
@@ -1472,6 +1929,13 @@ def _unify_same_source_targets(
             work_groups.append(eligible)
     for members in work_groups:
         members = [member for member in members if not policy_blocks_canonical_share(member)]
+        if any(member.metadata.get("desktop_revision") for member in members):
+            # A reviewed target is bound to its own context: the same English
+            # source may render differently elsewhere ("fire" in a tooltip vs a
+            # plain display), so a majority vote must neither rewrite the
+            # revision nor vote its wording onto sibling contexts. Explicit
+            # corrections stay the only way such a sibling changes.
+            continue
         distinct = {member.final_target for member in members}
         if len(distinct) <= 1:
             continue
@@ -1496,11 +1960,13 @@ def _unify_same_source_targets(
     # source word, are what the conflict report must explain.
     normalized_groups: dict[str, list[TextUnit]] = defaultdict(list)
     for unit in units:
-        if unit.final_target and not unit.metadata.get("layout_container"):
+        if unit.final_target:
             normalized_groups[unit.source_text.strip().lower()].append(unit)
     for normalized, members in normalized_groups.items():
         distinct = {member.final_target for member in members}
         if len(distinct) <= 1:
+            continue
+        if not _layout_divergence_is_reportable(members):
             continue
         _record_consistency_conflict(
             conflicts,
@@ -1509,6 +1975,23 @@ def _unify_same_source_targets(
             members,
         )
     return unified, sorted(conflicts.values(), key=lambda entry: entry["normalized"])
+
+
+def _layout_divergence_is_reportable(members: list[TextUnit]) -> bool:
+    """Whether one source with several targets belongs in the consistency report.
+
+    Sign / TextDisplay slots may legitimately reword the same source to fit
+    their block, so a divergence *between slots* is not a defect by itself and
+    would otherwise flood the report with排版 noise. A divergence between a
+    reflowable slot and a place the text is not reflowed (a command, a title,
+    an ordinary display field) is: the same name must not read two ways in one
+    map. Non-layout text keeps its historical behaviour.
+    """
+
+    has_layout = any(member.metadata.get("layout_container") for member in members)
+    if not has_layout:
+        return True
+    return any(not member.metadata.get("layout_container") for member in members)
 
 
 def _merge_conflict_lists(*groups: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -1689,6 +2172,7 @@ def _process_nested_archives(
     translator: TranslatorProvider,
     registry: PluginRegistry,
     max_ai: int | None,
+    progress: TaskProgress | None = None,
     mod_assets: ModAssetLibrary | None = None,
     seed_translations: SeedTranslations | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -1698,6 +2182,7 @@ def _process_nested_archives(
     manual_targets: dict[str, str] | None = None,
     translate_npc: bool = True,
     task_root: Path | None = None,
+    input_fingerprint: str = "",
 ) -> tuple[list[TextUnit], int, int, int, list[str], dict[str, int], list[ModCoverageEntry], list[ArchiveResult], list[dict[str, object]], bool]:
     all_units: list[TextUnit] = []
     translated_total = 0
@@ -1716,15 +2201,20 @@ def _process_nested_archives(
         for path in iter_files(root)
         if path.suffix.lower() in {".jar", ".zip"} and zipfile.is_zipfile(path)
     ]
+    if progress is not None:
+        progress.archives_discovered = len(archives)
     for index, archive_path in enumerate(archives, start=1):
         _check_cancel(cancel_event)
         archive_rel = archive_path.relative_to(root).as_posix()
         original_fingerprint = archive_fingerprint(archive_path) if archive_path.is_file() else ""
+        if progress is not None:
+            progress.archive_index = index
         _emit(
             progress_callback,
             "nested",
             f"处理内嵌压缩包 {index} / {len(archives)}",
             78 + int(10 * (index - 1) / max(1, len(archives))),
+            progress,
             current_file=archive_rel,
             archive_id=archive_rel,
             archive_index=index,
@@ -1755,7 +2245,13 @@ def _process_nested_archives(
                 continue
 
             excluded_paths, asset_seeds, archive_coverage = _apply_mod_assets(archive_root, mod_assets, archive=archive_rel)
-            scan_result = scan(archive_root, registry, cancel_event=cancel_event, allow_new_names=False)
+            scan_result = scan(
+                archive_root,
+                registry,
+                cancel_event=cancel_event,
+                allow_new_names=False,
+                input_fingerprint=input_fingerprint,
+            )
             scan_result.text_units = _filter_excluded_units(scan_result.text_units, excluded_paths)
             nested_seeds: SeedTranslations = dict(asset_seeds)
             if seed_translations:
@@ -1763,9 +2259,16 @@ def _process_nested_archives(
                 for (file_path, format_name, locator, source_text), target in seed_translations.items():
                     if file_path.startswith(prefix):
                         nested_seeds[_seed_key(file_path[len(prefix) :], format_name, locator, source_text)] = target
+            # Archive identity first: memory keys built during translation must
+            # already carry it, or sibling archives collide (B2).
+            _mark_archive_identity(scan_result.text_units, archive_rel)
             _apply_seed_targets(scan_result.text_units, nested_seeds)
             _apply_desktop_choices(scan_result.text_units, skip_unit_keys or set(), manual_targets or {}, prefix=f"{archive_rel}!/", official_terms=official_terms, translate_npc=translate_npc)
             groups_before = int(getattr(translator, "groups_completed", 0))
+            if progress is not None:
+                # Count this archive's units into the task total. A per-event
+                # local count must never overwrite the task-wide figure.
+                progress.begin_scanned(len(scan_result.text_units))
             translated, reused, skipped = translate_units(
                 [u for u in scan_result.text_units if not u.metadata.get("desktop_skip")],
                 glossary,
@@ -1779,6 +2282,7 @@ def _process_nested_archives(
                 seed_translations=nested_seeds,
                 cancel_event=cancel_event,
                 official_terms=official_terms,
+                progress=progress,
             )
             consumed_groups = int(getattr(translator, "groups_completed", 0)) - groups_before
             if remaining_ai is not None:
@@ -1788,13 +2292,19 @@ def _process_nested_archives(
             nested_baseline = take_baseline(archive_root, scan_result)
             try:
                 write_translations(archive_root, scan_result.text_units, registry, warnings=scan_result.warnings, cancel_event=cancel_event)
+                if progress is not None:
+                    # Write-back may have reverted candidates it refused; the
+                    # count must follow the unit state, not the earlier promise.
+                    progress.observe(scan_result.text_units)
                 nested_audit = audit_output(
                     archive_root,
                     baseline=nested_baseline,
                     baseline_scan=scan_result,
+                    input_fingerprint=input_fingerprint,
                     units=scan_result.text_units,
                     registry=registry,
                     cancel_event=cancel_event,
+                    official_terms_zh=_official_targets_by_key(official_terms),
                 )
             finally:
                 del nested_baseline
@@ -1891,6 +2401,21 @@ def _process_nested_archives(
     return all_units, translated_total, reused_total, skipped_total, warnings, filtered_counts, mod_coverage, archive_results, filtered_details, any_blocked
 
 
+def _task_groups(progress: TaskProgress | None, translator: TranslatorProvider, task_field: str, provider_field: str) -> int:
+    """Group count from the task when it has one, else from the provider.
+
+    ``getattr(..., 0)`` alone silently reported 0 for providers that do not
+    maintain these attributes (C1). The task-side value is authoritative when
+    present; the provider's is kept as a fallback for older providers.
+    """
+
+    if progress is not None:
+        value = getattr(progress, task_field, None)
+        if isinstance(value, int) and value:
+            return value
+    return int(getattr(translator, provider_field, 0))
+
+
 def _build_translation_report(
     input_path: Path,
     output_path: Path,
@@ -1902,6 +2427,7 @@ def _build_translation_report(
     warnings: list[str],
     filtered_counts: dict[str, int],
     mod_coverage: list[ModCoverageEntry],
+    infos: list[str] | None = None,
     audit: dict[str, object] | None = None,
     audit_blocked: bool = False,
     nbt_text_diff: dict[str, object] | None = None,
@@ -1915,6 +2441,7 @@ def _build_translation_report(
     workspace_path: str = "",
     report_path: str = "",
     recoverable: bool = False,
+    progress: TaskProgress | None = None,
 ) -> TranslationReport:
     layout_groups = build_translation_groups(all_units)
     units_translated = sum(1 for unit in all_units if unit.final_target not in (None, unit.source_text))
@@ -1932,17 +2459,22 @@ def _build_translation_report(
     return TranslationReport(
         input_path=input_path,
         output_path=output_path,
+        input_fingerprint=task_input_fingerprint(input_path) if input_path.exists() else "",
         scanned=len(all_units),
         translated=translated,
         reused=reused,
         skipped=skipped,
         high_risk=sum(1 for unit in all_units if unit.risk_level == RiskLevel.HIGH),
         warnings=warnings,
+        infos=list(infos or []),
         failure_counts=dict(getattr(translator, "failure_counts", {})),
         failure_samples=dict(getattr(translator, "failure_samples", {})),
         retry_counts=dict(getattr(translator, "retry_counts", {})),
-        groups_total=int(getattr(translator, "groups_total", 0)),
-        groups_completed=int(getattr(translator, "groups_completed", 0)),
+        # Prefer the task's own count. The provider's attributes are not part of
+        # the declared interface, so a provider that does not maintain them used
+        # to report "0 groups" in the finished report as well.
+        groups_total=_task_groups(progress, translator, "groups_total", "groups_total"),
+        groups_completed=_task_groups(progress, translator, "groups_done", "groups_completed"),
         failed_groups=int(getattr(translator, "failed_groups", 0)),
         reviewed_groups=int(getattr(translator, "reviewed_groups", 0)),
         review_corrected=int(getattr(translator, "review_corrected", 0)),
@@ -1955,6 +2487,8 @@ def _build_translation_report(
         rate_limit_cooldowns=int(getattr(translator, "rate_limit_cooldowns", 0)),
         checkpointed_groups=int(getattr(translator, "checkpointed_groups", 0)),
         seeded_drafts=int(getattr(translator, "seeded_drafts", 0)),
+        terms_injected=int(getattr(translator, "terms_injected", 0)),
+        terms_hit=int(getattr(translator, "terms_hit", 0)),
         consistency_unified=int(getattr(translator, "consistency_unified", 0)),
         consistency_conflicts=list(getattr(translator, "consistency_conflicts", [])),
         reference_index=dict(reference_index or {}),
@@ -1970,6 +2504,7 @@ def _build_translation_report(
         units_writeback_failed=units_writeback_failed,
         unit_outcomes=unit_outcomes,
         filtered_details=list(filtered_details or []),
+        filtered_detail_total=max(len(filtered_details or []), sum(filtered_counts.values())),
         event_log_path=event_log_path,
         nbt_text_diff=nbt_text_diff,
         structure_conflicts=list(structure_conflicts or []),
@@ -2014,13 +2549,24 @@ def run_translation(
     memory: TranslationMemory | None = None
     event_sink: EventSink | None = None
     sink_token = None
+    last_progress: ProgressEvent | None = None
+    if progress_callback is not None:
+        user_progress_callback = progress_callback
+
+        def track_progress(event: ProgressEvent) -> None:
+            nonlocal last_progress
+            last_progress = event
+            user_progress_callback(event)
+
+        progress_callback = track_progress
     try:
         if _preflight:
             _preflight_output(input_path, output_path)
         event_sink = None if user_logs_disabled() else EventSink.create_default()
         if event_sink is not None:
             sink_token = set_current_sink(event_sink)
-        _emit(progress_callback, "prepare", "正在准备输入资源", 3, current_file=str(input_path))
+        progress = TaskProgress()
+        _emit(progress_callback, "prepare", "正在准备输入资源", 3, progress, current_file=str(input_path))
         registry = default_registry()
         library = _resolve_mod_assets(mod_assets)
         working_root = copy_input(input_path, output_path, cancel_event=cancel_event)
@@ -2033,8 +2579,13 @@ def run_translation(
         if glossary_path:
             glossary = glossary.merge(Glossary.from_file(glossary_path))
 
-        memory_path = memory_path or (working_root / ".mc-hanhua" / "translation-memory-context-v3.sqlite")
-        memory = TranslationMemory(memory_path)
+        memory_path = memory_path or (working_root / ".mc-hanhua" / MEMORY_DB_FILENAME)
+        # Scope the shared cache to this input version. The store lives beside
+        # the output, so two maps written into one directory share the file;
+        # without a namespace their rows are interchangeable whenever a file
+        # path and a source string coincide (B1).
+        input_fingerprint = task_input_fingerprint(input_path)
+        memory = TranslationMemory(memory_path, namespace=input_fingerprint)
         translator = translator or translator_from_env()
         official_index = _resolve_official_terms(official_terms, official_terms_dir, official_terms_version)
         if official_index is not None and hasattr(translator, "official_terms"):
@@ -2043,15 +2594,17 @@ def run_translation(
         combined_seeds = dict(asset_seeds)
         if seed_translations:
             combined_seeds.update(seed_translations)
-        scan_result = scan(working_root, registry, cancel_event=cancel_event)
+        scan_result = scan(working_root, registry, cancel_event=cancel_event, input_fingerprint=input_fingerprint)
         scan_result.text_units = _filter_excluded_units(scan_result.text_units, excluded_paths)
         _apply_seed_targets(scan_result.text_units, combined_seeds)
         _apply_desktop_choices(scan_result.text_units, skip_unit_keys or set(), manual_targets or {}, official_terms=official_index, translate_npc=translate_npc)
+        progress.begin_scanned(len(scan_result.text_units))
         _emit(
             progress_callback,
             "scan",
             f"扫描到 {len(scan_result.text_units)} 条文本，已过滤 {sum(scan_result.filtered_counts.values())} 条非翻译内容",
             18,
+            progress,
             scanned=len(scan_result.text_units),
             filtered_counts=dict(scan_result.filtered_counts),
         )
@@ -2066,19 +2619,24 @@ def run_translation(
             seed_translations=combined_seeds,
             cancel_event=cancel_event,
             official_terms=official_index,
+            progress=progress,
         )
         skipped += sum(bool(u.metadata.get("desktop_skip")) for u in scan_result.text_units)
         reused += sum(entry.keys_covered for entry in mod_coverage if entry.match_type == "full")
-        _emit(progress_callback, "write", "正在写入汉化文本", 76, scanned=len(scan_result.text_units), translated=translated, reused=reused, skipped=skipped)
+        progress.observe(scan_result.text_units)
+        _emit(progress_callback, "write", "正在写入汉化文本", 76, progress, scanned=len(scan_result.text_units), translated=translated, reused=reused, skipped=skipped)
         # Audit root files before entering nested AI work. Each archive has its
         # own pre-write baseline and publication gate below.
         baseline_snapshot = take_baseline(working_root, scan_result)
         try:
             write_translations(working_root, scan_result.text_units, registry, warnings=scan_result.warnings, cancel_event=cancel_event)
-            _emit(progress_callback, "audit", "正在审计根图写回结果", 77, scanned=len(scan_result.text_units))
+            progress.observe(scan_result.text_units)
+            _emit(progress_callback, "audit", "正在审计根图写回结果", 77, progress, scanned=len(scan_result.text_units))
             audit_result = audit_output(
                 working_root, baseline=baseline_snapshot, baseline_scan=scan_result,
                 units=scan_result.text_units, registry=registry, cancel_event=cancel_event,
+                input_fingerprint=input_fingerprint,
+                official_terms_zh=_official_targets_by_key(official_index),
             )
         finally:
             del baseline_snapshot
@@ -2091,6 +2649,7 @@ def run_translation(
             translator,
             registry,
             remaining_ai,
+            progress,
             mod_assets=library,
             seed_translations=combined_seeds,
             progress_callback=progress_callback,
@@ -2100,6 +2659,7 @@ def run_translation(
             manual_targets=manual_targets,
             translate_npc=translate_npc,
             task_root=task_root or (working_root / ".mc-hanhua"),
+            input_fingerprint=input_fingerprint,
         )
         all_units = [*scan_result.text_units, *nested_units]
         if manual_targets:
@@ -2118,11 +2678,13 @@ def run_translation(
         filtered_counts = dict(scan_result.filtered_counts)
         _merge_counts(filtered_counts, nested_filtered_counts)
         combined_filtered_details = [*scan_result.filtered_details, *nested_filtered_details]
+        progress.observe(all_units)
         _emit(
             progress_callback,
             "audit",
             f"发布前审计完成：{len(audit_result.errors)} 个阻断问题，{len(audit_result.warnings)} 个警告",
             90,
+            progress,
             scanned=len(all_units),
             audit_errors=len(audit_result.errors),
             audit_warnings=len(audit_result.warnings),
@@ -2153,6 +2715,7 @@ def run_translation(
             warnings,
             filtered_counts,
             [*mod_coverage, *nested_mod_coverage],
+            infos=scan_result.infos,
             audit=audit_result.to_dict(),
             audit_blocked=blocked,
             nbt_text_diff=nbt_text_diff,
@@ -2166,6 +2729,7 @@ def run_translation(
             workspace_path=str(task_root or working_root),
             report_path=str(json_report_path),
             recoverable=blocked,
+            progress=progress,
         )
         write_json_report(json_report_path, report, all_units)
         write_html_report(html_report_path, report, all_units)
@@ -2200,6 +2764,7 @@ def run_translation(
             "complete",
             f"资源处理完成；布局重排 {report.layout_reflow_groups} 组，跨牌告示 {report.spatial_sign_clusters} 组",
             92,
+            progress,
             scanned=report.scanned,
             translated=report.translated,
             reused=report.reused,
@@ -2237,7 +2802,16 @@ def run_translation(
                 output_path=displayed_output,
             )
             attach_diagnostic_path(exc, log_path)
-        _emit(progress_callback, "paused", str(exc), 0, last_error=str(exc))
+        stats = _progress_stats(last_progress)
+        _emit(
+            progress_callback,
+            "paused",
+            str(exc),
+            last_progress.percent if last_progress is not None else 0,
+            progress,
+            **stats,
+            last_error=str(exc),
+        )
         raise
     except Exception as exc:
         if _write_failure_log:
@@ -2249,7 +2823,16 @@ def run_translation(
                 output_path=displayed_output,
             )
             attach_diagnostic_path(exc, log_path)
-            _emit(progress_callback, "failed", f"处理失败：{exc}", 0, last_error=str(exc))
+        stats = _progress_stats(last_progress)
+        _emit(
+            progress_callback,
+            "failed",
+            f"处理失败：{exc}",
+            last_progress.percent if last_progress is not None else 0,
+            progress,
+            **stats,
+            last_error=str(exc),
+        )
         raise
     finally:
         if sink_token is not None:
@@ -2269,6 +2852,16 @@ def translate_archive_to_file(
     output_archive = output_archive.resolve()
     cancel_event = kwargs.get("cancel_event")
     job_dir: Path | None = None
+    last_progress: ProgressEvent | None = None
+    if progress_callback is not None:
+        user_progress_callback = progress_callback
+
+        def track_progress(event: ProgressEvent) -> None:
+            nonlocal last_progress
+            last_progress = event
+            user_progress_callback(event)
+
+        progress_callback = track_progress
     try:
         _preflight_output(input_path, output_archive)
         _emit(progress_callback, "prepare", "正在检查输出位置", 2, current_file=str(output_archive))
@@ -2279,8 +2872,8 @@ def translate_archive_to_file(
         for directory in (cache_dir, reports_dir, work_dir):
             directory.mkdir(parents=True, exist_ok=True)
         legacy_cache_dir = output_archive.parent / ".mc-hanhua-cache"
-        memory_path = cache_dir / "translation-memory-context-v3.sqlite"
-        legacy_memory_path = legacy_cache_dir / "translation-memory-context-v3.sqlite"
+        memory_path = cache_dir / MEMORY_DB_FILENAME
+        legacy_memory_path = legacy_cache_dir / MEMORY_DB_FILENAME
         if not memory_path.exists() and legacy_memory_path.is_file():
             memory_path = legacy_memory_path
         run_kwargs = dict(kwargs)
@@ -2311,9 +2904,9 @@ def translate_archive_to_file(
         )
         _copy_long_term_reports(tmp_output, job_dir, reports_dir, output_archive.stem)
         temp_archive = job_dir / f"{output_archive.stem}.tmp{output_archive.suffix}"
-        _emit(progress_callback, "pack", "正在压缩输出文件", 94, scanned=report.scanned, translated=report.translated, reused=report.reused, skipped=report.skipped, failure_counts=report.failure_counts, retry_counts=report.retry_counts)
+        _emit(progress_callback, "pack", "正在压缩输出文件", 94, **_report_progress_stats(report))
         repack_directory(tmp_output, temp_archive, exclude_tool_metadata=True, cancel_event=cancel_event)
-        _emit(progress_callback, "save", "正在保存输出文件", 98, scanned=report.scanned, translated=report.translated, reused=report.reused, skipped=report.skipped, failure_counts=report.failure_counts, retry_counts=report.retry_counts)
+        _emit(progress_callback, "save", "正在保存输出文件", 98, **_report_progress_stats(report))
         temp_archive.replace(output_archive)
         report.output_path = output_archive
         report.publication_status = "published"
@@ -2321,7 +2914,7 @@ def translate_archive_to_file(
         # long-term store beside the output (A11).
         report.report_path = str(reports_dir / f"{output_archive.stem}-translation-report.json")
         report.workspace_path = str(output_archive.parent / ".mc-hanhua")
-        _emit(progress_callback, "complete", "汉化完成", 100, scanned=report.scanned, translated=report.translated, reused=report.reused, skipped=report.skipped, failure_counts=report.failure_counts, retry_counts=report.retry_counts)
+        _emit(progress_callback, "complete", "汉化完成", 100, **_report_progress_stats(report))
         shutil.rmtree(job_dir, ignore_errors=True)
         return report
     except TranslationPaused as exc:
@@ -2334,7 +2927,15 @@ def translate_archive_to_file(
         )
         attach_diagnostic_path(exc, log_path)
         _attach_recovery_paths(exc, job_dir)
-        _emit(progress_callback, "paused", str(exc), 0, last_error=str(exc))
+        stats = _progress_stats(last_progress)
+        _emit(
+            progress_callback,
+            "paused",
+            str(exc),
+            last_progress.percent if last_progress is not None else 0,
+            **stats,
+            last_error=str(exc),
+        )
         raise
     except Exception as cop:
         _copy_long_term_reports(job_dir / "output" if job_dir is not None else None, job_dir, reports_dir if "reports_dir" in locals() else None, output_archive.stem)
@@ -2346,7 +2947,15 @@ def translate_archive_to_file(
         )
         attach_diagnostic_path(cop, log_path)
         _attach_recovery_paths(cop, job_dir)
-        _emit(progress_callback, "failed", f"保存或处理失败：{cop}", 0, last_error=str(cop))
+        stats = _progress_stats(last_progress)
+        _emit(
+            progress_callback,
+            "failed",
+            f"保存或处理失败：{cop}",
+            last_progress.percent if last_progress is not None else 0,
+            **stats,
+            last_error=str(cop),
+        )
         raise
 
 
@@ -2472,7 +3081,13 @@ def republish_from_workspace(
     with tempfile.TemporaryDirectory(prefix="mc-hanhua-reaudit-") as tmp:
         base_root = Path(tmp) / "input"
         copy_input(input_path, base_root, cancel_event=cancel_event)
-        input_scan = scan(base_root, registry, cancel_event=cancel_event, allow_new_names=False)
+        input_scan = scan(
+            base_root,
+            registry,
+            cancel_event=cancel_event,
+            allow_new_names=False,
+            input_fingerprint=task_input_fingerprint(input_path),
+        )
         for result in archive_results:
             staging = Path(result.staging_path) if result.staging_path else workspace / "archives" / _safe_archive_id(result.archive_id) / "output"
             if not staging.is_dir():
@@ -2486,7 +3101,13 @@ def republish_from_workspace(
             _emit(progress_callback, "audit", f"正在重新审计 {result.archive_id}", 80, archive_id=result.archive_id, current_file=result.archive_id)
             nested_root = Path(tmp) / "nested" / _safe_archive_id(result.archive_id)
             copy_input(input_side, nested_root, cancel_event=cancel_event)
-            nested_scan = scan(nested_root, registry, cancel_event=cancel_event, allow_new_names=False)
+            nested_scan = scan(
+                nested_root,
+                registry,
+                cancel_event=cancel_event,
+                allow_new_names=False,
+                input_fingerprint=task_input_fingerprint(input_path),
+            )
             nested_baseline = take_baseline(nested_root, nested_scan)
             prefix = f"{result.archive_id}!/"
             nested_units = []

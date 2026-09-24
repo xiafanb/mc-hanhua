@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import shutil
 import urllib.error
-import urllib.request
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -12,7 +11,8 @@ from PySide6.QtCore import QThread, Signal
 
 from .archives import ARCHIVE_SUFFIXES
 from .diagnostics import write_failure_log
-from .gui_support import _models_endpoint
+from .quality import MEMORY_DB_FILENAME
+from .translator import fetch_available_models
 
 
 def run_translation(*args, **kwargs):
@@ -153,7 +153,7 @@ class TranslationWorker(QThread):
         job_dir = Path(tempfile.mkdtemp(prefix="directory-job-", dir=work_dir))
         stage = job_dir / "output"
         options = dict(self.options)
-        options.setdefault("memory_path", runtime / "cache" / "translation-memory-context-v3.sqlite")
+        options.setdefault("memory_path", runtime / "cache" / MEMORY_DB_FILENAME)
         options.setdefault("task_root", job_dir)
         options.setdefault("task_id", job_dir.name)
         try:
@@ -223,7 +223,10 @@ class TranslationWorker(QThread):
                 continue
             self.records_loaded.emit(payload)
             return ""
-        if preferred:
+        if preferred and Path(preferred).is_file():
+            # Only a file that exists but cannot be read is a read failure. A
+            # run that failed during scanning never wrote a report; saying
+            # "报告读取失败：…work\" then just adds noise to the real error.
             return f"报告读取失败：{preferred}"
         return ""
 
@@ -345,26 +348,11 @@ class ModelListWorker(QThread):
         self.api_key = api_key
 
     def run(self) -> None:
+        # Delegate to the shared implementation so the Qt dialog, the HTML
+        # shell and the translator all normalise endpoints and parse model
+        # listings (id/name/model/slug/display_name) identically.
         try:
-            headers = {"Accept": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            request = urllib.request.Request(_models_endpoint(self.base_url), headers=headers, method="GET")
-            with urllib.request.urlopen(request, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            raw_models = payload.get("data", payload.get("models", [])) if isinstance(payload, dict) else []
-            models: list[str] = []
-            if isinstance(raw_models, list):
-                for item in raw_models:
-                    if isinstance(item, str):
-                        models.append(item)
-                    elif isinstance(item, dict):
-                        value = item.get("id") or item.get("name") or item.get("model")
-                        if isinstance(value, str):
-                            models.append(value)
-            models = sorted(set(models), key=str.lower)
-            if not models:
-                raise ValueError("接口未返回可用模型")
+            models = fetch_available_models(self.base_url, self.api_key)
             self.loaded.emit(models)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
             self.failed.emit(str(exc))

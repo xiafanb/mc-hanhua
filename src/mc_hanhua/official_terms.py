@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .utils import UNREADABLE_TEXT_ERRORS
+
 # source_hash is SHA-256 of canonical UTF-8 JSON:
 # {"en_us": <object>, "zh_cn": <object>} with sort_keys=True and separators=(",", ":").
 _CANONICAL_SEPARATORS = (",", ":")
@@ -83,7 +85,7 @@ class OfficialTermIndex:
         try:
             en_data = json.loads(en_us_path.read_text(encoding="utf-8-sig"))
             zh_data = json.loads(zh_cn_path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except UNREADABLE_TEXT_ERRORS as exc:
             warnings.append(f"official_terms_unreadable: {exc}")
             return cls(warnings=warnings, game_version=game_version, source_kind=source_kind, status="unavailable")
         if not isinstance(en_data, dict) or not isinstance(zh_data, dict):
@@ -194,6 +196,26 @@ class OfficialTermIndex:
             unique.append(term)
         return unique
 
+    def _resolves_to_own_entry(self, key: str | None, source_text: str, game_version: str | None) -> bool:
+        """Whether this text is itself an official entry.
+
+        True when the key is in the baseline (even if the pack spells the English
+        slightly differently) or when the source text equals an official source
+        ignoring case and surrounding whitespace. Such a string's own official
+        translation is the authority; a *shorter* term it happens to contain must
+        not override it.
+        """
+
+        normalized = " ".join(source_text.split()).casefold()
+        for term in self._official_terms():
+            if not self._version_ok(term, game_version):
+                continue
+            if key and term.key == key:
+                return True
+            if normalized and " ".join(term.source.split()).casefold() == normalized:
+                return True
+        return False
+
     def validate_candidate(
         self,
         source_text: str,
@@ -205,12 +227,22 @@ class OfficialTermIndex:
     ) -> str | None:
         if not self.available:
             return None
+        own_term = None
         if key:
-            term = self.lookup_exact(key, source_text, game_version)
-            if term is not None and target_text != term.target:
+            own_term = self.lookup_exact(key, source_text, game_version)
+            if own_term is not None and target_text != own_term.target:
                 return "official_term_conflict"
-        if role:
-            for term in self.terms_for_context(source_text, role, game_version):
-                if term.target not in target_text:
-                    return "official_term_conflict"
+        if not role:
+            return None
+        # A complete official string is governed by its own translation. Demanding
+        # that a component term's target also appear rejected correct work on a
+        # real map: "The End... Again..." was refused because the sibling key
+        # "The End" -> 末地 was not present, and "Deep Cold Ocean" because "Ocean"
+        # -> 海洋 was absent — while both candidates matched the official Chinese
+        # exactly. Only free text that merely *embeds* a term is still enforced.
+        if own_term is not None or self._resolves_to_own_entry(key, source_text, game_version):
+            return None
+        for term in self.terms_for_context(source_text, role, game_version):
+            if term.target not in target_text:
+                return "official_term_conflict"
         return None

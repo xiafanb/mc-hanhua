@@ -127,12 +127,15 @@ def read_region_chunks(path: Path) -> list[dict[str, Any]]:
         compression = data[start + 4]
         if length < 1 or start + 4 + length > start + sectors * 4096 or start + 4 + length > len(data):
             raise ValueError(f"Region chunk {index} has invalid payload length")
-        if start + sectors * 4096 > len(data):
-            # A short raw_chunk would shift every later chunk on rewrite, so
-            # declared sectors past EOF must fail closed.
-            raise ValueError(f"Region chunk {index} declares sectors past the end of file")
+        declared_end = start + sectors * 4096
+        truncated = declared_end > len(data)
         payload = data[start + 5 : start + 4 + length]
-        raw_chunk = data[start : start + sectors * 4096]
+        raw_chunk = data[start:declared_end]
+        if truncated:
+            # Some map archives remove only the zero padding after the final
+            # valid chunk. Restore the missing padding in memory so a later
+            # write can rebuild a sector-aligned region without moving data.
+            raw_chunk += b"\x00" * (declared_end - len(data))
         try:
             if compression == 1:
                 nbt_data = gzip.decompress(payload)
@@ -152,6 +155,7 @@ def read_region_chunks(path: Path) -> list[dict[str, Any]]:
                 "raw": raw_chunk,
                 "doc": doc,
                 "changed": False,
+                "truncated": truncated,
             }
         )
     return chunks

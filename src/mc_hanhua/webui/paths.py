@@ -64,6 +64,7 @@ SHELL_STATES = (
     "initial",
     "loaded",
     "scanned",
+    "translating",
     "card-expanded-edit",
     "prefs-open",
     "connection-dialog",

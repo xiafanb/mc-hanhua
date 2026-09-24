@@ -1,0 +1,125 @@
+{
+  "note": "Reviewed sentence fragments that may be dropped from a display leaf. A fragment is only droppable when the passage that continues its sentence was reviewed with it: the write door (quality.validate_reuse) allows an empty target for this exact span, and the independent audit (audit._audit_fragment_merges) re-reads the declared passage and blocks unless it is present, translated and free of the dropped fragment's English word. Entries are keyed by input fingerprint + exact locator, so repacking or editing the input expires them. Mechanism and unknown fields are never in this table: they are not extracted as display units at all. Locators come from a real pipeline.scan on the real input; see .local/p2/build_fragment_allowlist.py.",
+  "entries": [
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/dungeons/function/eldinmine/miners/ebizo/ebizo.mcfunction",
+      "locator": "{\"line\": 14, \"command\": {\"kind\": \"json\", \"json_start\": 94, \"pointer\": \"/3/text\"}}",
+      "source": "\nThe ",
+      "passage": [
+        "{\"line\": 14, \"command\": {\"kind\": \"json\", \"json_start\": 94, \"pointer\": \"/3/text\"}}",
+        "{\"line\": 14, \"command\": {\"kind\": \"json\", \"json_start\": 94, \"pointer\": \"/4/text\"}}",
+        "{\"line\": 14, \"command\": {\"kind\": \"json\", \"json_start\": 94, \"pointer\": \"/5/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是没有独立语义的英文功能词；中文由其后的段落承担",
+      "evidence": "独立诊断 §3.2：实机 00:37:37 显示 `Maram\\nThe 法隆森林它们位于村庄的正南方…`"
+    },
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/npcs/function/faronvillage/maram.mcfunction",
+      "locator": "{\"line\": 11, \"command\": {\"kind\": \"json\", \"json_start\": 81, \"pointer\": \"/3/text\"}}",
+      "source": "\nThe ",
+      "passage": [
+        "{\"line\": 11, \"command\": {\"kind\": \"json\", \"json_start\": 81, \"pointer\": \"/3/text\"}}",
+        "{\"line\": 11, \"command\": {\"kind\": \"json\", \"json_start\": 81, \"pointer\": \"/4/text\"}}",
+        "{\"line\": 11, \"command\": {\"kind\": \"json\", \"json_start\": 81, \"pointer\": \"/5/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是没有独立语义的英文功能词；中文由其后的段落承担",
+      "evidence": "独立诊断 §3.2：实机 00:37:37 显示 `Maram\\nThe 法隆森林它们位于村庄的正南方…`"
+    },
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/npcs/function/hateno/mosus.mcfunction",
+      "locator": "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/3/text\"}}",
+      "source": "\nThe ",
+      "passage": [
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/3/text\"}}",
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/4/text\"}}",
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/5/text\"}}",
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/7/text\"}}",
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/8/text\"}}",
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/9/text\"}}",
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/10/text\"}}",
+        "{\"line\": 96, \"command\": {\"kind\": \"json\", \"json_start\": 79, \"pointer\": \"/11/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是没有独立语义的英文功能词；中文由其后的段落承担",
+      "evidence": "独立诊断 §3.2：实机 00:37:37 显示 `Maram\\nThe 法隆森林它们位于村庄的正南方…`"
+    },
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/npcs/function/hyrule/zelda.mcfunction",
+      "locator": "{\"line\": 95, \"command\": {\"kind\": \"json\", \"json_start\": 111, \"pointer\": \"/3/text\"}}",
+      "source": "\nThe ",
+      "passage": [
+        "{\"line\": 95, \"command\": {\"kind\": \"json\", \"json_start\": 111, \"pointer\": \"/3/text\"}}",
+        "{\"line\": 95, \"command\": {\"kind\": \"json\", \"json_start\": 111, \"pointer\": \"/4/text\"}}",
+        "{\"line\": 95, \"command\": {\"kind\": \"json\", \"json_start\": 111, \"pointer\": \"/5/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是没有独立语义的英文功能词；中文由其后的段落承担",
+      "evidence": "独立诊断 §3.2：实机 00:37:37 显示 `Maram\\nThe 法隆森林它们位于村庄的正南方…`"
+    },
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/npcs/function/kakarikovillage/impaz.mcfunction",
+      "locator": "{\"line\": 32, \"command\": {\"kind\": \"json\", \"json_start\": 102, \"pointer\": \"/3/text\"}}",
+      "source": "\nThe ",
+      "passage": [
+        "{\"line\": 32, \"command\": {\"kind\": \"json\", \"json_start\": 102, \"pointer\": \"/3/text\"}}",
+        "{\"line\": 32, \"command\": {\"kind\": \"json\", \"json_start\": 102, \"pointer\": \"/4/text\"}}",
+        "{\"line\": 32, \"command\": {\"kind\": \"json\", \"json_start\": 102, \"pointer\": \"/5/text\"}}",
+        "{\"line\": 32, \"command\": {\"kind\": \"json\", \"json_start\": 102, \"pointer\": \"/6/text\"}}",
+        "{\"line\": 32, \"command\": {\"kind\": \"json\", \"json_start\": 102, \"pointer\": \"/7/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是没有独立语义的英文功能词；中文由其后的段落承担",
+      "evidence": "独立诊断 §3.2：实机 00:37:37 显示 `Maram\\nThe 法隆森林它们位于村庄的正南方…`"
+    },
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/npcs/function/kakarikovillage/yujito.mcfunction",
+      "locator": "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/3/text\"}}",
+      "source": "\nThe ",
+      "passage": [
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/3/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/4/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/5/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/6/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/7/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/8/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/9/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/10/text\"}}",
+        "{\"line\": 34, \"command\": {\"kind\": \"json\", \"json_start\": 97, \"pointer\": \"/11/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是没有独立语义的英文功能词；中文由其后的段落承担",
+      "evidence": "独立诊断 §3.2：实机 00:37:37 显示 `Maram\\nThe 法隆森林它们位于村庄的正南方…`"
+    },
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/npcs/function/zorasdomain/dorephan.mcfunction",
+      "locator": "{\"line\": 46, \"command\": {\"kind\": \"json\", \"json_start\": 103, \"pointer\": \"/3/text\"}}",
+      "source": "\nThe ",
+      "passage": [
+        "{\"line\": 46, \"command\": {\"kind\": \"json\", \"json_start\": 103, \"pointer\": \"/3/text\"}}",
+        "{\"line\": 46, \"command\": {\"kind\": \"json\", \"json_start\": 103, \"pointer\": \"/4/text\"}}",
+        "{\"line\": 46, \"command\": {\"kind\": \"json\", \"json_start\": 103, \"pointer\": \"/5/text\"}}",
+        "{\"line\": 46, \"command\": {\"kind\": \"json\", \"json_start\": 103, \"pointer\": \"/6/text\"}}",
+        "{\"line\": 46, \"command\": {\"kind\": \"json\", \"json_start\": 103, \"pointer\": \"/7/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是没有独立语义的英文功能词；中文由其后的段落承担",
+      "evidence": "独立诊断 §3.2：实机 00:37:37 显示 `Maram\\nThe 法隆森林它们位于村庄的正南方…`"
+    },
+    {
+      "package_fingerprint": "e66b3681a87c4c0926b803d0b38772a59761a366977ab9d5de7d52d07dc4a140",
+      "file": "RoH - Release 1.0/datapacks/zelda/data/npcs/function/hyrule/mizumi.mcfunction",
+      "locator": "{\"line\": 38, \"command\": {\"kind\": \"json\", \"json_start\": 80, \"pointer\": \"/5/text\"}}",
+      "source": " a ",
+      "passage": [
+        "{\"line\": 38, \"command\": {\"kind\": \"json\", \"json_start\": 80, \"pointer\": \"/5/text\"}}",
+        "{\"line\": 38, \"command\": {\"kind\": \"json\", \"json_start\": 80, \"pointer\": \"/5/text\"}}",
+        "{\"line\": 38, \"command\": {\"kind\": \"json\", \"json_start\": 80, \"pointer\": \"/6/text\"}}"
+      ],
+      "reason": "原文把一句话拆成相邻 tellraw 段，本段是孤立的英文冠词/代词，中文语序由相邻段落承担",
+      "evidence": "独立诊断 §3.2：实机显示 `米尼什高原 a 就在这里东边一点`（第三版仍留英文 a）",
+      "promoted": true
+    }
+  ]
+}

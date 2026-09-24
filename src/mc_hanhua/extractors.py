@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from .nbt import (
 from .plugins import ExtractorPlugin, WriterPlugin
 from .policy import (
     GENERIC_JSON_TEXT_KEYS,
+    POLICY_IMMUTABLE_MATCH,
     POLICY_TRANSLATABLE,
     POLICY_UNKNOWN,
     apply_unit_policy,
@@ -31,22 +33,49 @@ from .policy import (
     classify_nbt_path,
 )
 from .text_components import (
+    INTERACTIVE_LEAF_METADATA,
     PLAYER_NAME_RE,
+    InteractiveLeaf,
+    _extract_json_entries,
     apply_command_text,
+    apply_json_command_text,
     apply_json_text,
     collect_mechanism_refs,
     collect_selector_refs,
     command_locator_is_valid,
     command_locator_offset,
     command_targets_text_display,
+    component_document,
+    component_skip_reason,
+    composed_pointer,
+    encoded_component_locator,
     escape_pointer_part,
     extract_command_texts,
+    extract_component_texts,
     extract_json_texts,
     get_json_pointer,
+    interactive_leaf_contexts,
+    is_item_match_context,
+    item_component_display_key,
+    item_component_producer_function,
     read_command_text,
+    read_json_command_text,
+    read_json_pointer_text,
     set_json_pointer,
+    split_encoded_component_locator,
+    validate_interactive_command_change,
 )
-from .utils import detect_risk, dump_json, is_visual_glyph_art, load_json, looks_translatable, read_text, stable_id, write_text
+from .utils import (
+    UNREADABLE_TEXT_ERRORS,
+    detect_risk,
+    dump_json,
+    is_visual_glyph_art,
+    load_json,
+    looks_translatable,
+    read_text,
+    stable_id,
+    write_text,
+)
 
 LANG_PATTERN = re.compile(r"assets[/\\][^/\\]+[/\\]lang[/\\].+\.(json|lang)$", re.IGNORECASE)
 SOURCE_LANGS = {"en_us"}
@@ -76,7 +105,9 @@ class JsonLangPlugin(ExtractorPlugin, WriterPlugin):
         self.last_filtered_details: list[dict[str, object]] = []
         try:
             data = load_json(path)
-        except (OSError, json.JSONDecodeError):
+        except UNREADABLE_TEXT_ERRORS:
+            # Undecodable (e.g. macOS ``__MACOSX/._x.json`` metadata) counts as
+            # unparseable: skip the file, never abort the task.
             return []
         if not isinstance(data, dict):
             return []
@@ -144,7 +175,12 @@ class LegacyLangPlugin(ExtractorPlugin, WriterPlugin):
         self.last_filtered_counts: dict[str, int] = {}
         self.last_filtered_details: list[dict[str, object]] = []
         units: list[TextUnit] = []
-        for index, line in enumerate(read_text(path).splitlines()):
+        try:
+            lines = read_text(path).splitlines()
+        except UNREADABLE_TEXT_ERRORS:
+            # Undecodable counts as unparseable: skip, never abort the task.
+            return []
+        for index, line in enumerate(lines):
             if not line or line.lstrip().startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
@@ -221,7 +257,8 @@ class GenericJsonTextPlugin(ExtractorPlugin, WriterPlugin):
         self.last_filtered_details: list[dict[str, object]] = []
         try:
             data = load_json(path)
-        except (OSError, json.JSONDecodeError):
+        except UNREADABLE_TEXT_ERRORS:
+            # Undecodable counts as unparseable: skip, never abort the task.
             return []
         rel = _rel(root, path)
         units: list[TextUnit] = []
@@ -242,16 +279,53 @@ class GenericJsonTextPlugin(ExtractorPlugin, WriterPlugin):
                 policy=policy,
             )
 
-        def walk(value: Any, pointer: str, parent_key: str = "", skip_reason: str = "") -> None:
+        def walk(
+            value: Any,
+            pointer: str,
+            parent_key: str = "",
+            skip_reason: str = "",
+            keys: tuple[str, ...] = (),
+            item_producer: bool = False,
+        ) -> None:
             if isinstance(value, dict):
                 external_action = _is_external_url_action(value)
                 for key, child in value.items():
                     child_skip = "external_link_label" if external_action and str(key).lower() == "label" else skip_reason
-                    walk(child, f"{pointer}/{escape_pointer_part(str(key))}", str(key), child_skip)
+                    # An item's own component list is only proven by the loot
+                    # function that writes it (``minecraft:set_components``);
+                    # a plugin object that merely has a `components` key does not.
+                    child_producer = item_producer or (
+                        str(key) == "components" and isinstance(child, dict) and item_component_producer_function(value)
+                    )
+                    walk(child, f"{pointer}/{escape_pointer_part(str(key))}", str(key), child_skip, (*keys, str(key)), child_producer)
             elif isinstance(value, list):
                 for index, child in enumerate(value):
-                    walk(child, f"{pointer}/{index}", parent_key, skip_reason)
+                    walk(child, f"{pointer}/{index}", parent_key, skip_reason, keys, item_producer)
             elif isinstance(value, str):
+                if item_component_display_key(parent_key, keys[:-1]):
+                    if is_item_match_context(keys, rel):
+                        # A consumer (item predicate, criteria): the same key is
+                        # an exact match value, so its text is never opened.
+                        filtered(
+                            "component_match_context",
+                            pointer,
+                            value,
+                            policy=POLICY_IMMUTABLE_MATCH,
+                            policy_reason="item predicate match value",
+                        )
+                        return
+                    if item_producer:
+                        if _add_encoded_component_units(rel, self.name, pointer, value, units, filtered):
+                            return
+                        # Not component-shaped: the game reads the value as a
+                        # literal component, so it stays ordinary display text
+                        # and the key's own rules below decide.
+                    elif component_document(value) is not None:
+                        # Component-shaped text under a display key that no
+                        # producer proves (a plugin's own field).  Nothing is
+                        # opened and the skip is recorded instead of silent.
+                        filtered("component_context_unproven", pointer, value)
+                        return
                 key_is_textual = parent_key.lower() in self.TEXT_KEYS
                 if not key_is_textual:
                     return
@@ -260,6 +334,13 @@ class GenericJsonTextPlugin(ExtractorPlugin, WriterPlugin):
                     return
                 if is_visual_glyph_art(value):
                     filtered("visual_glyph", pointer, value)
+                    return
+                if component_document(value) is not None:
+                    # A JSON component written where prose was expected: the
+                    # shaped string must not be handed to the model as if it
+                    # were text (writing a translation back would destroy the
+                    # component).  Fail closed and say why.
+                    filtered("component_json_not_opened", pointer, value)
                     return
                 if looks_translatable(value):
                     risk = RiskLevel(detect_risk(value, pointer))
@@ -287,15 +368,96 @@ class GenericJsonTextPlugin(ExtractorPlugin, WriterPlugin):
 
     def write(self, root: Path, path: Path, units: list[TextUnit]) -> int:
         data = load_json(path)
+        rel = _rel(root, path)
         changed = 0
         for unit in units:
             if unit.final_target is None:
+                continue
+            encoded = split_encoded_component_locator(unit.locator)
+            if encoded is not None:
+                outer_pointer, component_pointer = encoded
+                try:
+                    current = get_json_pointer(data, outer_pointer)
+                except (KeyError, TypeError, ValueError, IndexError):
+                    current = None
+                if not isinstance(current, str):
+                    unit.metadata["writeback_status"] = "failed"
+                    _emit_command_writeback(unit, "failed", "component_locator_missing", file_path=rel)
+                    continue
+                try:
+                    updated = apply_json_text(current, component_pointer, unit.final_target)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    # The component no longer parses: fail closed instead of
+                    # replacing the string with unproven text.
+                    unit.metadata["writeback_status"] = "failed"
+                    _emit_command_writeback(unit, "failed", "component_json_unparsed", file_path=rel)
+                    continue
+                if updated != current:
+                    set_json_pointer(data, outer_pointer, updated)
+                    changed += 1
+                continue
+            try:
+                current = get_json_pointer(data, unit.locator)
+            except (KeyError, TypeError, ValueError, IndexError):
+                current = None
+            if current == unit.final_target:
+                # Identity write: keep the file's bytes untouched.
                 continue
             set_json_pointer(data, unit.locator, unit.final_target)
             changed += 1
         if changed:
             dump_json(path, data)
         return changed
+
+
+def _add_encoded_component_units(
+    rel: str,
+    format_name: str,
+    pointer: str,
+    value: str,
+    units: list[TextUnit],
+    filtered: Callable[..., None],
+) -> bool:
+    """Open a JSON-encoded item display component; every other field stays shut.
+
+    The game parses this string as a component, so the visible text is one level
+    below the file's own pointer.  Units carry the two-part identity (outer JSON
+    pointer + inner component pointer) that write-back, read-back, grouping,
+    memory keys and the audit all resolve the same way.  A string that cannot be
+    parsed is fail-closed: it is reported, never half-opened and never written.
+
+    Returns ``False`` for a value that is not component-shaped at all: the game
+    reads such a value as a literal text component, so the caller keeps treating
+    it as ordinary display text.
+    """
+
+    if not value.strip().startswith(("{", "[", '"')):
+        return False
+    leaves = extract_component_texts(value)
+    if not leaves:
+        filtered(component_skip_reason(value), pointer, value)
+        return True
+    for inner, text in leaves:
+        if not looks_translatable(text):
+            filtered("component_leaf_filtered", composed_pointer(pointer, inner), text)
+            continue
+        locator = json.dumps(encoded_component_locator(pointer, inner), ensure_ascii=False)
+        unit = apply_unit_policy(
+            TextUnit(
+                id=stable_id(rel, locator, text),
+                source_text=text,
+                file_path=rel,
+                format=format_name,
+                locator=locator,
+                context=pointer,
+                risk_level=RiskLevel(detect_risk(text, pointer)),
+            )
+        )
+        if unit.policy != POLICY_TRANSLATABLE:
+            filtered("policy_blocked", composed_pointer(pointer, inner), text, policy=unit.policy, policy_reason=unit.policy_reason)
+            continue
+        units.append(unit)
+    return True
 
 
 def _is_external_url_action(value: dict[str, Any]) -> bool:
@@ -310,23 +472,59 @@ def _is_external_url_action(value: dict[str, Any]) -> bool:
     return False
 
 
-def _emit_mcfunction_writeback_failed(unit: TextUnit, reason: str) -> None:
-    """Record a command write-back that could not locate its payload."""
+def _emit_command_writeback(unit: TextUnit, status: str, reason: str, file_path: str = "") -> None:
+    """Record a command write-back that could not locate or could not safely rewrite its payload."""
 
     emit_event(
         stage="writeback",
-        file=unit.file_path,
+        file=file_path or unit.file_path,
         format=unit.format,
         locator=unit.locator,
         context=unit.context,
         unit_id=unit.id,
         source=unit.source_text,
         policy=unit.policy,
-        writeback_status="failed",
+        writeback_status=status,
         writeback_target=unit.final_target or "",
         writeback_changed=False,
         extra={"reason": reason},
     )
+
+
+def _interactive_leaf_metadata(
+    command_locator: dict[str, object],
+    contexts: dict[str, InteractiveLeaf],
+    extracted_pointers: set[str],
+) -> dict[str, bool] | None:
+    """Scan-time layout role of one extracted display leaf, or ``None``.
+
+    ``clickable``: the leaf carries an inherited click event, so its trailing
+    ASCII pad is the row's own width.  ``gap_after_furniture``: the fragment
+    drawn right before it is furniture *and* produced no unit of its own — a
+    leaf with no unit is never rewritten (the writer only ever applies units),
+    so the leading run continues that furniture and is provably layout, while a
+    space after a translated sentence is an English word gap Chinese does not
+    write.  ``layout_breaks``: a clickable fragment follows, so this span's own
+    explicit breaks are what place it.  Leaves the render walk never reached
+    (hover tooltips, nested command payloads) get nothing.
+    """
+
+    if command_locator.get("kind") != "json":
+        return None
+    leaf = contexts.get(str(command_locator.get("pointer")))
+    if leaf is None:
+        return None
+    clickable = leaf.clickable
+    gap_after_furniture = (
+        clickable and leaf.preceded_by_furniture and leaf.previous_pointer not in extracted_pointers
+    )
+    if not (clickable or gap_after_furniture or leaf.before_last_clickable):
+        return None
+    return {
+        "clickable": clickable,
+        "gap_after_furniture": gap_after_furniture,
+        "layout_breaks": leaf.before_last_clickable,
+    }
 
 
 class McfunctionPlugin(ExtractorPlugin, WriterPlugin):
@@ -337,24 +535,51 @@ class McfunctionPlugin(ExtractorPlugin, WriterPlugin):
 
     def extract(self, root: Path, path: Path) -> list[TextUnit]:
         rel = _rel(root, path)
+        self.last_fragment_candidates: list[dict[str, object]] = []
         self.last_selector_refs: set[str] = set()
         self.last_mechanism_refs: set[str] = set()
         self.last_commands: list[tuple[str, str]] = []
         self.last_filtered_counts: dict[str, int] = {}
         self.last_filtered_details: list[dict[str, object]] = []
         units: list[TextUnit] = []
-        for line_no, line in enumerate(read_text(path).splitlines()):
+        try:
+            lines = read_text(path).splitlines()
+        except UNREADABLE_TEXT_ERRORS:
+            # Undecodable counts as unparseable: skip, never abort the task.
+            return []
+        for line_no, line in enumerate(lines):
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             self.last_selector_refs.update(collect_selector_refs(line))
             self.last_selector_refs.update(collect_mechanism_refs(line))
             self.last_mechanism_refs.update(collect_mechanism_refs(line))
             self.last_commands.append((rel, line))
-            for command_locator, text in extract_command_texts(
-                line, self.last_filtered_counts, filtered_details=self.last_filtered_details, file_path=rel
-            ):
+            line_candidates: list[dict[str, object]] = []
+            line_units = extract_command_texts(
+                line,
+                self.last_filtered_counts,
+                filtered_details=self.last_filtered_details,
+                file_path=rel,
+                fragment_candidates=line_candidates,
+            )
+            # Per-leaf layout context of a clickable message, computed from the
+            # scan-time line: the row's own pad, the control-row gap, and which
+            # spans sit before a control row.  Keyed by payload pointer, never
+            # by text, so two components that happen to read alike cannot be
+            # confused (see ``text_components.interactive_leaf_contexts``).
+            contexts = interactive_leaf_contexts(line)
+            layout = {"layout_container": "text-display"} if command_targets_text_display(line) else {}
+            extracted_pointers = {
+                str(locator.get("pointer"))
+                for locator, _text in line_units
+                if locator.get("kind") == "json"
+            }
+            for command_locator, text in line_units:
                 locator = json.dumps({"line": line_no, "command": command_locator}, ensure_ascii=False)
-                metadata = {"layout_container": "text-display"} if command_targets_text_display(line) else {}
+                metadata = dict(layout)
+                declared = _interactive_leaf_metadata(command_locator, contexts, extracted_pointers)
+                if declared is not None:
+                    metadata[INTERACTIVE_LEAF_METADATA] = declared
                 units.append(
                     apply_unit_policy(
                         TextUnit(
@@ -369,10 +594,26 @@ class McfunctionPlugin(ExtractorPlugin, WriterPlugin):
                         )
                     )
                 )
+            for candidate in line_candidates:
+                self.last_fragment_candidates.append(
+                    {
+                        "locator": json.dumps(
+                            {"line": line_no, "command": candidate.get("locator")}, ensure_ascii=False
+                        ),
+                        "text": str(candidate.get("text") or ""),
+                        "file_path": rel,
+                    }
+                )
         return units
 
     def write(self, root: Path, path: Path, units: list[TextUnit]) -> int:
         lines = read_text(path).splitlines()
+        # Scan-time input version of every line.  Sibling spans of one command are
+        # applied in reverse offset order, so ``lines`` is the working copy: the
+        # interaction check must compare a candidate against the line as it was
+        # read (the message the player sees in the input), never against a state
+        # that already carries some siblings' rewrites.
+        original_lines = list(lines)
         changed = 0
         by_line: dict[int, list[tuple[TextUnit, dict[str, object]]]] = defaultdict(list)
         for unit in units:
@@ -383,15 +624,36 @@ class McfunctionPlugin(ExtractorPlugin, WriterPlugin):
             if not (0 <= line_no < len(lines)):
                 for unit, _command_locator in line_units:
                     unit.metadata["writeback_status"] = "failed"
-                    _emit_mcfunction_writeback_failed(unit, reason="line_missing")
+                    _emit_command_writeback(unit, "failed", "line_missing")
                 continue
             for unit, command_locator in sorted(line_units, key=lambda item: command_locator_offset(item[1]), reverse=True):
                 if not command_locator_is_valid(lines[line_no], command_locator):
                     unit.metadata["writeback_status"] = "failed"
-                    _emit_mcfunction_writeback_failed(unit, reason="locator_missing")
+                    _emit_command_writeback(unit, "failed", "locator_missing")
                     continue
                 original = lines[line_no]
-                new_line = apply_command_text(original, command_locator, unit.final_target or "")
+                refusals: list[str] = []
+                new_line = apply_command_text(original, command_locator, unit.final_target or "", refusals=refusals)
+                if refusals:
+                    # The span was left untouched on purpose: rewriting it could
+                    # change what the game reads. Report instead of claiming a write.
+                    unit.metadata["writeback_status"] = "blocked"
+                    unit.metadata["candidate_validation"] = {"origin": "writeback", "reason": refusals[0]}
+                    _emit_command_writeback(unit, "blocked", refusals[0])
+                    continue
+                interaction = validate_interactive_command_change(original_lines[line_no], new_line)
+                if interaction is not None:
+                    # The span itself is valid, but this line builds a clickable
+                    # menu and the candidate moved a control row, emptied a
+                    # label or rewrote alignment padding. Only this candidate is
+                    # refused; the other spans of the line keep their proven
+                    # translations. What stays on disk is the source, so that is
+                    # what the unit reports from now on.
+                    unit.metadata["writeback_status"] = "blocked"
+                    unit.metadata["candidate_validation"] = {"origin": "writeback", "reason": interaction}
+                    unit.final_target = unit.source_text
+                    _emit_command_writeback(unit, "blocked", interaction)
+                    continue
                 unit.metadata["writeback_status"] = "changed" if new_line != original else "unchanged"
                 if new_line != original:
                     lines[line_no] = new_line
@@ -417,6 +679,7 @@ class NbtTextPlugin(ExtractorPlugin, WriterPlugin):
         self.last_mechanism_refs: set[str] = set()
         self.last_commands: list[tuple[str, str]] = []
         self.last_warnings: list[str] = []
+        self.last_infos: list[str] = []
         try:
             if path.suffix.lower() == ".mca":
                 units: list[TextUnit] = []
@@ -450,6 +713,9 @@ class NbtTextPlugin(ExtractorPlugin, WriterPlugin):
                 commands=self.last_commands,
             )
         except Exception as exc:
+            if path.suffix.lower() == ".mca" and path.stat().st_size == 0:
+                self.last_infos.append(f"空 NBT region 占位已跳过：{rel}")
+                return []
             if path.suffix.lower() == ".mca" and path.stat().st_size >= 8192:
                 raise
             # Sub-header region stubs (0-byte poi/entities placeholders) cannot
@@ -684,12 +950,23 @@ def _add_entity_display_name_units(
 ) -> None:
     display = _decode_custom_name_value(value)
     json_texts = extract_json_texts(value)
-    texts = [text for _pointer, text in json_texts] if json_texts else ([display] if looks_translatable(display) else [])
-    if not texts:
+    if json_texts:
+        # Keep the inner pointer of every leaf.  A locator that only names the
+        # NBT path would make the audit mask the whole TAG_STRING, so a writer
+        # could replace the encoded component with raw text and still pass.
+        leaves: list[tuple[str | None, str]] = [(pointer, text) for pointer, text in json_texts]
+    elif looks_translatable(display):
+        # Plain (non-component) CustomName: the path alone is the identity.
+        leaves = [(None, display)]
+    else:
         return
     metadata = _entity_display_metadata(root, path, chunk_id)
-    for text in texts:
+    for pointer, text in leaves:
         locator: dict[str, object] = {"path": path}
+        if pointer is not None:
+            # Empty pointer = a bare JSON string component ('"Name"'); the key
+            # must still be present so read-back and the audit resolve the leaf.
+            locator["json"] = pointer
         if chunk_id is not None:
             locator["chunk"] = chunk_id
         unit = apply_unit_policy(
@@ -720,10 +997,17 @@ def _add_nbt_string_units(
     chunk_id: str | None,
 ) -> None:
     layout_metadata = _nbt_layout_metadata(root, path, chunk_id)
-    json_texts = extract_json_texts(value)
-    if json_texts:
-        for pointer, text in json_texts:
-            locator: dict[str, object] = {"path": path, "json": pointer}
+    json_entries = _extract_json_entries(value, file_path=rel)
+    if json_entries:
+        for entry, text in json_entries:
+            locator: dict[str, object] = {"path": path}
+            if entry.get("kind") == "embedded_command":
+                locator["json_command"] = {
+                    "pointer": entry.get("pointer", ""),
+                    "command": entry.get("command"),
+                }
+            else:
+                locator["json"] = entry.get("pointer", "")
             if chunk_id is not None:
                 locator["chunk"] = chunk_id
             units.append(
@@ -889,12 +1173,24 @@ def _apply_nbt_units(root: NbtTag, units: list[TextUnit], file_path: str = "") -
                     extra={"reason": "not_string"},
                 )
                 continue
-            if "json" in locator:
+            refusals: list[str] = []
+            if "json_command" in locator:
+                nested = locator["json_command"]
+                new_value = (
+                    apply_json_command_text(tag.value, nested, unit.final_target, refusals=refusals) if isinstance(nested, dict) else tag.value
+                )
+            elif "json" in locator:
                 new_value = apply_json_text(tag.value, str(locator["json"]), unit.final_target)
             elif "command" in locator:
-                new_value = apply_command_text(tag.value, locator["command"], unit.final_target)
+                new_value = apply_command_text(tag.value, locator["command"], unit.final_target, refusals=refusals)
             else:
                 new_value = unit.final_target
+            if refusals:
+                # Left the tag untouched on purpose (see apply_command_text).
+                unit.metadata["writeback_status"] = "blocked"
+                unit.metadata["candidate_validation"] = {"origin": "writeback", "reason": refusals[0]}
+                _emit_command_writeback(unit, "blocked", refusals[0], file_path=file_path)
+                continue
             did_change = new_value != tag.value
             if did_change:
                 set_string(root, path, new_value)
@@ -1194,7 +1490,7 @@ def _read_language_located_text(path: Path, unit: TextUnit) -> str:
     if unit.format == "json-lang":
         try:
             data = load_json(target_path)
-        except (OSError, json.JSONDecodeError) as exc:
+        except UNREADABLE_TEXT_ERRORS as exc:
             raise LocatedTextReadError("source_corrupt", str(exc)) from exc
         if not isinstance(data, dict):
             raise LocatedTextReadError("source_corrupt", "language file is not an object")
@@ -1219,10 +1515,20 @@ def _read_generic_json_located_text(path: Path, unit: TextUnit) -> str:
         raise LocatedTextReadError("missing_file", str(path))
     try:
         data = load_json(path)
+        encoded = split_encoded_component_locator(unit.locator)
+        if encoded is not None:
+            outer_pointer, component_pointer = encoded
+            container = get_json_pointer(data, outer_pointer)
+            if not isinstance(container, str):
+                raise LocatedTextReadError("locator_missing", "encoded component is not a string")
+            found = read_json_pointer_text(container, component_pointer)
+            if found is None:
+                raise LocatedTextReadError("locator_missing", "component leaf missing")
+            return found
         found = get_json_pointer(data, unit.locator)
     except FileNotFoundError as exc:
         raise LocatedTextReadError("missing_file", str(exc)) from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except UNREADABLE_TEXT_ERRORS as exc:
         raise LocatedTextReadError("source_corrupt", str(exc)) from exc
     except (KeyError, TypeError, ValueError, IndexError) as exc:
         raise LocatedTextReadError("locator_missing", str(exc)) from exc
@@ -1292,6 +1598,14 @@ def _read_nbt_located_text(path: Path, unit: TextUnit, *, cache: dict[str, Any] 
         raise LocatedTextReadError("locator_missing", str(exc)) from exc
     if tag.type_id != TAG_STRING:
         raise LocatedTextReadError("locator_missing", "NBT tag is not a string")
+    if "json_command" in locator:
+        nested = locator["json_command"]
+        if not isinstance(nested, dict):
+            raise LocatedTextReadError("locator_missing", "embedded JSON command locator missing")
+        found = read_json_command_text(tag.value, nested)
+        if found is None:
+            raise LocatedTextReadError("locator_missing", "embedded command leaf missing")
+        return found
     if "json" in locator:
         try:
             found = get_json_pointer(json.loads(tag.value), str(locator["json"]))

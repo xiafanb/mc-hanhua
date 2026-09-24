@@ -8,6 +8,18 @@ from pathlib import Path
 from .models import ArchiveResult, TextUnit, TranslationReport, summarize_failure_counts
 
 
+def _intentional_keep_reason(unit: TextUnit) -> str:
+    """Reason a provider deliberately kept this source, or ``""``.
+
+    Serialized per unit because it is the only thing that tells an English text
+    left in place on purpose (``quality.INTENTIONAL_KEEP``) from one that never
+    produced a candidate: the unit has no final target either way.
+    """
+
+    marker = unit.metadata.get("intentional_keep")
+    return str(marker.get("reason") or "") if isinstance(marker, dict) else ""
+
+
 def write_json_report(path: Path, report: TranslationReport, units: list[TextUnit]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     report_payload = asdict(report)
@@ -34,6 +46,7 @@ def write_json_report(path: Path, report: TranslationReport, units: list[TextUni
                 "translation_status": unit.metadata.get("translation_status", ""),
                 "review_status": unit.metadata.get("review_status", ""),
                 "writeback_status": unit.metadata.get("writeback_status", ""),
+                "intentional_keep": _intentional_keep_reason(unit),
                 "archive_id": unit.metadata.get("archive_id", ""),
                 "archive_chain": list(unit.metadata.get("archive_chain") or []),
             }
@@ -62,6 +75,7 @@ def write_html_report(path: Path, report: TranslationReport, units: list[TextUni
         for reason, sample in report.failure_samples.items()
     ) or "<li>none</li>"
     warnings = "".join(f"<li>{html.escape(warning)}</li>" for warning in report.warnings) or "<li>none</li>"
+    infos = "".join(f"<li>{html.escape(info)}</li>" for info in report.infos) or "<li>none</li>"
     empty_notice = (
         "<p><strong>未发现可翻译文本：未产生任何 AI 请求，输出为输入的原样副本。</strong></p>"
         if report.scanned == 0
@@ -191,7 +205,7 @@ def write_html_report(path: Path, report: TranslationReport, units: list[TextUni
     filter_section = (
         f"""
   <h2>提取过滤明细</h2>
-  <p>以下为脱敏、限长后的过滤样本（共 {len(report.filtered_details)} 条）。未知字段默认不送 AI。</p>
+  <p>以下为脱敏、限长后的过滤样本（显示 {len(report.filtered_details)} / 共 {report.filtered_detail_total} 条）。未知字段默认不送 AI。{('已达到样本上限，完整数量以统计为准。' if report.filtered_detail_total > len(report.filtered_details) else '')}</p>
   <ul>{filter_rows or '<li>none</li>'}</ul>"""
         if report.filtered_details
         else ""
@@ -219,6 +233,7 @@ def write_html_report(path: Path, report: TranslationReport, units: list[TextUni
         if report.structure_conflicts
         else ""
     )
+    outcome_account = "、".join(f"{name} {count}" for name, count in sorted(report.unit_outcomes.items())) or "none"
     page = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -236,14 +251,18 @@ def write_html_report(path: Path, report: TranslationReport, units: list[TextUni
   {empty_notice}
   <p>Scanned: {report.scanned} | Translated: {report.translated} | Reused: {report.reused} | Skipped: {report.skipped} | High risk: {report.high_risk}</p>
   <p>Units: total {report.units_total} | translated {report.units_translated} | original preserved {report.units_original_preserved} | validation failed {report.units_validation_failed} | writeback failed {report.units_writeback_failed}</p>
+  <p>Outcome account: {html.escape(outcome_account)}. A unit has exactly one outcome; intentional keeps and mechanism-locked identifiers are decisions, not missed translations.</p>
   <p>Text groups: {report.groups_completed} / {report.groups_total} | Failed groups: {report.failed_groups} | Reviewed: {report.reviewed_groups} | Review pending: {report.review_pending_groups} | Review corrections: {report.review_corrected}</p>
   <p>Planned calls: draft {report.planned_draft_calls} + review {report.planned_review_calls} | Seeded drafts: {report.seeded_drafts} | Actual API requests: {report.api_requests} | Rate-limit cooldowns: {report.rate_limit_cooldowns} | Checkpoints: {report.checkpointed_groups}</p>
   <p>API-reported tokens: input {report.token_usage.get('prompt_tokens', 'unavailable')} | output {report.token_usage.get('completion_tokens', 'unavailable')} | cached input {report.token_usage.get('cached_tokens', 'unavailable')} | reasoning {report.token_usage.get('reasoning_tokens', 'unavailable')} | Requests reporting usage: {report.usage_reported_requests}. Cached and reasoning tokens are subsets; missing usage is not zero.</p>
   <p>Layout reflow groups: {report.layout_reflow_groups} | Spatial sign clusters: {report.spatial_sign_clusters} | Same-source unified: {report.consistency_unified}</p>
+  <p>Native terminology: injected {report.terms_injected} | target present in accepted translation {report.terms_hit}. Zero means the provider carries terms in the prompt (chat mode) or no term matched the sent text.</p>
   <p>Filtered before AI: {html.escape(summarize_failure_counts(report.filtered_counts) or 'none')}</p>
   <p>Failure reasons: {html.escape(summarize_failure_counts(report.failure_counts) or 'none')} | Retries: {html.escape(summarize_failure_counts(report.retry_counts) or 'none')}</p>
   <h2>诊断与警告</h2>
   <ul>{warnings}</ul>
+  <h2>扫描提示</h2>
+  <ul>{infos}</ul>
   {filter_section}
   {nbt_section}
   {structure_section}

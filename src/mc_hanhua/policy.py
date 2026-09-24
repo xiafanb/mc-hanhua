@@ -15,7 +15,19 @@ import json
 from typing import Any
 
 from .models import TextUnit
-from .text_components import SNBT_MECHANISM_KEYS, SNBT_NONTEXT_KEYS, SNBT_PARENTED_TEXT_KEYS, SNBT_TEXT_KEYS
+from .text_components import (
+    COMPONENT_RECURSIVE_KEYS,
+    SNBT_MECHANISM_KEYS,
+    SNBT_NONTEXT_KEYS,
+    SNBT_PARENTED_TEXT_KEYS,
+    SNBT_TEXT_KEYS,
+    TEXT_COMPONENT_KEYS,
+    is_item_component_producer_path,
+    is_item_match_context,
+    item_component_display_key,
+    pointer_key_parts,
+    split_encoded_component_locator,
+)
 
 POLICY_IMMUTABLE_ID = "IMMUTABLE_ID"
 POLICY_IMMUTABLE_MATCH = "IMMUTABLE_MATCH_VALUE"
@@ -75,6 +87,7 @@ IMMUTABLE_MATCH_KEYS = {
 # Already-audited player-visible display keys.
 TRANSLATABLE_LEAF_KEYS = {
     "text",
+    "dialog",
     "fallback",
     "title",
     "subtitle",
@@ -332,6 +345,39 @@ def classify_json_pointer(pointer: str, *, format_name: str = "generic-json", re
     return POLICY_UNKNOWN, f"unaudited JSON field {leaf}"
 
 
+def classify_encoded_component(
+    outer_pointer: str,
+    component_pointer: str,
+    *,
+    format_name: str = "generic-json",
+    file_path: str = "",
+) -> tuple[str, str]:
+    """Classify a text leaf inside a JSON-encoded component.
+
+    The leaf only counts as display text when the string it lives in was proven
+    to be an item's own display component (``components/minecraft:custom_name``
+    and friends) *and* that component is a producer.  A predicate's match value
+    and anything else stays unknown even if its inner key looks like a component
+    text key, so a hand-built locator cannot open a new surface.
+    """
+
+    key_parts = pointer_key_parts(outer_pointer)
+    if not is_item_component_producer_path(key_parts) or not item_component_display_key(key_parts[-1], key_parts[:-1]):
+        return POLICY_UNKNOWN, f"JSON-encoded component outside a proven item component list: {outer_pointer}"
+    if is_item_match_context(key_parts, file_path):
+        return POLICY_IMMUTABLE_MATCH, "item predicate match value"
+    # Inside the component the outer key is already proven, so the leaf's own
+    # role decides: the audited display keys, the recursive extra/with
+    # containers, or a bare JSON string component (inner pointer "").
+    if not component_pointer:
+        return POLICY_TRANSLATABLE, "item component text written as a JSON string"
+    inner = pointer_key_parts(component_pointer)
+    leaf = inner[-1].lower() if inner else ""
+    if leaf in TEXT_COMPONENT_KEYS or leaf in COMPONENT_RECURSIVE_KEYS:
+        return POLICY_TRANSLATABLE, f"component display leaf type {leaf}"
+    return POLICY_UNKNOWN, f"unaudited JSON-encoded component leaf {leaf or component_pointer}"
+
+
 def _command_payload_policy(locator: dict[str, Any]) -> tuple[str, str] | None:
     """Classify an embedded command payload by SNBT/JSON role, not the Command key."""
 
@@ -395,6 +441,9 @@ def classify_unit(unit: TextUnit) -> tuple[str, str]:
     if unit.format in {"json-lang", "legacy-lang"}:
         return POLICY_TRANSLATABLE, "language-file value"
     if unit.format == "generic-json":
+        encoded = split_encoded_component_locator(unit.locator)
+        if encoded is not None:
+            return classify_encoded_component(encoded[0], encoded[1], format_name=unit.format, file_path=unit.file_path)
         return classify_json_pointer(unit.locator, format_name=unit.format)
     return POLICY_UNKNOWN, f"unknown format {unit.format}"
 

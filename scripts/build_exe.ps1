@@ -29,6 +29,9 @@ $icon = Join-Path $assetDir "app_icon.ico"
 $tubiao = Join-Path $assetDir "tubiao.png"
 $font = Join-Path $assetDir "NotoSansSC-VF.ttf"
 $terms = Join-Path $assetDir "official-terms"
+$allowlist = Join-Path $assetDir "mechanism-allowlist.json"
+$displayAllowlist = Join-Path $assetDir "display-argument-allowlist.json"
+$fragmentAllowlist = Join-Path $assetDir "fragment-merge-allowlist.json"
 
 $bundle = if ($Mode -eq "onedir") { "--onedir" } else { "--onefile" }
 $pyiArgs = @(
@@ -47,6 +50,11 @@ $pyiArgs = @(
   "--add-data", "$tubiao;assets",
   "--add-data", "$font;assets",
   "--add-data", "$terms;assets/official-terms",
+  # ADD-DATA 的 DEST 是目录：单文件必须写到所在的文件夹（文件名自带），
+  # 否则数据落在 assets/<name>.json/<name>.json，加载器读不到那张表。
+  "--add-data", "$allowlist;assets",
+  "--add-data", "$displayAllowlist;assets",
+  "--add-data", "$fragmentAllowlist;assets",
   "--add-data", "$webui;src/mc_hanhua/webui",
   $entry
 )

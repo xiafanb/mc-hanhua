@@ -78,9 +78,44 @@ def directory_fingerprint(root: Path) -> str:
 
 
 def input_fingerprint(path: Path) -> str:
+    """Identity of an input's *content*.
+
+    This is an input-version key, not a stable project identity: repacking an
+    unchanged map changes the archive bytes, and an unrelated file change
+    changes a directory hash. Callers use it to refuse reuse across versions;
+    they must not treat it as "the same map".
+    """
+
     if path.is_file():
         return archive_fingerprint(path)
     return directory_fingerprint(path)
+
+
+def task_input_fingerprint(path: Path) -> str:
+    """``input_fingerprint`` memoised per (path, size, mtime).
+
+    One task may want the identity several times (memory namespace, report
+    field, manifest), and hashing a multi-hundred-megabyte archive once per
+    caller is pure I/O. The stat triple invalidates the entry whenever the file
+    it describes actually changes, so the returned value stays truthful.
+    """
+
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return input_fingerprint(path)
+    cached = _FINGERPRINT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value = input_fingerprint(path)
+    if len(_FINGERPRINT_CACHE) > 32:
+        _FINGERPRINT_CACHE.clear()
+    _FINGERPRINT_CACHE[key] = value
+    return value
+
+
+_FINGERPRINT_CACHE: dict[tuple[str, int, int], str] = {}
 
 
 def _load_known(cls, payload: dict[str, Any]):

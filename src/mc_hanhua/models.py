@@ -81,6 +81,7 @@ class ScanResult:
     root: Path
     text_units: list[TextUnit] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    infos: list[str] = field(default_factory=list)
     filtered_counts: dict[str, int] = field(default_factory=dict)
     # Cross-file mechanism reference index: values consumed by selectors, NBT
     # predicates or clear/execute-if-items match clauses. A value in this set
@@ -94,6 +95,11 @@ class ScanResult:
     file_filtered: dict[str, dict[str, int]] = field(default_factory=dict)
     # Bounded, redacted details for every filtered string (not just counts).
     filtered_details: list[dict[str, Any]] = field(default_factory=list)
+    filtered_detail_total: int = 0
+    # Display leaves a command payload carries but ``looks_translatable`` refuses
+    # (a one/two-letter article between two real display leaves).  They are only
+    # promoted to units when the reviewed fragment table names them.
+    fragment_candidates: list[dict[str, Any]] = field(default_factory=list)
     # Cross-file reference index (definitions / uses / locked / unresolved).
     # Typed as Any so models stays import-cycle free; pipeline stores a ReferenceIndex.
     reference_index: Any = None
@@ -187,12 +193,17 @@ class ArchiveResult:
 class TranslationReport:
     input_path: Path
     output_path: Path
+    # Identity of the input *content* at the time of this run. A report may only
+    # seed a later run when this matches, so replacing a map file with a new
+    # version cannot import the previous version's translations (B3).
+    input_fingerprint: str = ""
     scanned: int = 0
     translated: int = 0
     reused: int = 0
     skipped: int = 0
     high_risk: int = 0
     warnings: list[str] = field(default_factory=list)
+    infos: list[str] = field(default_factory=list)
     failure_counts: dict[str, int] = field(default_factory=dict)
     failure_samples: dict[str, str] = field(default_factory=dict)
     retry_counts: dict[str, int] = field(default_factory=dict)
@@ -210,6 +221,11 @@ class TranslationReport:
     rate_limit_cooldowns: int = 0
     checkpointed_groups: int = 0
     seeded_drafts: int = 0
+    # Terminology sent through a provider's native term channel and how often
+    # its target survived into an accepted translation. Both stay 0 for
+    # providers that carry terms in the prompt instead.
+    terms_injected: int = 0
+    terms_hit: int = 0
     consistency_unified: int = 0
     consistency_conflicts: list[dict[str, object]] = field(default_factory=list)
     # Cross-file reference index snapshot for JSON / HTML / JSONL reports.
@@ -229,6 +245,7 @@ class TranslationReport:
     unit_outcomes: dict[str, int] = field(default_factory=dict)
     # Bounded, redacted filter details (file/path/source/reason).
     filtered_details: list[dict[str, Any]] = field(default_factory=list)
+    filtered_detail_total: int = 0
     # Path of the structured JSONL event stream when one was written.
     event_log_path: str = ""
     # Read-only input/output NBT text comparison and same-name structure
@@ -281,6 +298,8 @@ class ProgressEvent:
     rate_limit_cooldowns: int = 0
     checkpointed_groups: int = 0
     seeded_drafts: int = 0
+    terms_injected: int = 0
+    terms_hit: int = 0
     filtered_counts: dict[str, int] = field(default_factory=dict)
     units_total: int = 0
     units_translated: int = 0
@@ -289,6 +308,11 @@ class ProgressEvent:
     units_writeback_failed: int = 0
     audit_errors: int = 0
     audit_warnings: int = 0
+    # Per-HTTP-attempt latency, retry sleeps excluded, so a slow service is
+    # distinguishable from long client-side backoff.
+    last_attempt_ms: int = 0
+    avg_response_ms: int = 0
+    responded_requests: int = 0
     # Optional rich HTML payload (e.g. colored per-segment translation
     # results). When non-empty the GUI renders it in place of ``message``;
     # the runtime/text log always uses ``message`` (plain, searchable).
@@ -304,6 +328,9 @@ class ProgressEvent:
     units_published: int = 0
     archive_index: int = 0
     archives_discovered: int = 0
+    # Per-package figures. They describe the package being processed right now
+    # and are reported alongside the task-wide totals, never in place of them.
+    local_scanned: int = 0
     local_groups_total: int = 0
     local_groups_completed: int = 0
     requests_started: int = 0

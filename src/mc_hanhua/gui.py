@@ -45,7 +45,8 @@ from .gui_styles import STYLESHEET
 from .gui_support import StartupRequest, _parse_startup_request, _protect_text, _unprotect_text
 from .gui_workers import ModelListWorker, ScanPreviewWorker, TranslationWorker
 from .models import ProgressEvent, TranslationReport, summarize_failure_counts
-from .translator import OpenAICompatibleTranslator
+from .translator import translator_class_for
+from .utils import UNREADABLE_TEXT_ERRORS
 
 APP_TITLE = "Minecraft 汉化工具"
 
@@ -845,8 +846,9 @@ class MainWindow(QMainWindow):
             self._append_log(f"配置保存失败：{exc}")
 
         api_key = self._model_api_key
+        provider_class = translator_class_for(self.config.get("provider"))
         translator = (
-            OpenAICompatibleTranslator(
+            provider_class(
                 api_key=api_key,
                 base_url=self._base_url(),
                 model=self._model_value(),
@@ -1486,7 +1488,7 @@ class MainWindow(QMainWindow):
     def _load_config(self) -> dict[str, object]:
         try:
             data = json.loads(_config_path().read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except UNREADABLE_TEXT_ERRORS:
             return {}
         if not isinstance(data, dict):
             return {}
@@ -1510,6 +1512,7 @@ class MainWindow(QMainWindow):
         data: dict[str, object] = {
             "base_url": self._base_url(),
             "model": self._model_value(),
+            "provider": self.config.get("provider", "chat"),
             "max_ai": self.config.get("max_ai", 0),
             "ai_workers": self._ai_workers_value(),
             "quality_policy_version": 1,

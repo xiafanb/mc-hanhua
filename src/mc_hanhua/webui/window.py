@@ -9,16 +9,20 @@ from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Slot
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent
+from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent, QIcon, QMouseEvent, QWheelEvent
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QSystemTrayIcon, QVBoxLayout, QWidget
 
 from mc_hanhua.gui_support import StartupRequest
 from mc_hanhua.webui.controller import TaskController, model_request_is_current, unique_output_path
 from mc_hanhua.webui.paths import app_page_path, ensure_page_icon, icon_path
-from mc_hanhua.webui.present import classify_titlebar_press
+from mc_hanhua.webui.present import bank_logs, clamp_zoom, classify_titlebar_press, drop_plan, queue_advance
+
+# Log lines banked between pushes. The page keeps 2000 and the controller 2000,
+# so this only bounds a pathological burst; normal runs bank a handful.
+LOG_PENDING_MAX = 2000
 
 # Frameless-window resize handles. Keys are the CSS data-edge values from the
 # HTML shell; the window itself never paints a native title bar.
@@ -64,6 +68,15 @@ class HtmlMainWindow(QMainWindow):
         self._closing = False
         self._page_ready = False
         self._last_titlebar_press = (0.0, 0, 0)  # (monotonic seconds, x, y)
+        self._page_zoom = 1.0
+        self._pending_snapshot: dict | None = None
+        self._snapshot_in_flight = False
+        # Log lines banked for the next push, and the ids already delivered. The
+        # page renders what it is sent, so these two sets are what guarantee that
+        # coalescing a burst of snapshots cannot drop log text.
+        self._pending_logs: list[dict] = []
+        self._pending_log_ids: set[str] = set()
+        self._delivered_log_ids: set[str] = set()
         # The HTML shell paints its own themed title bar; the native one only
         # provides the taskbar entry, so it is removed entirely.
         self.setWindowFlag(Qt.FramelessWindowHint, True)
@@ -71,11 +84,16 @@ class HtmlMainWindow(QMainWindow):
         self.setMinimumSize(800, 600)
         available = self.screen().availableGeometry()
         self.resize(min(1280, available.width()), min(800, available.height()))
-        self.setAcceptDrops(True)
         try:
             self.setWindowIcon(QIcon(str(icon_path())))
         except FileNotFoundError:
             pass
+
+        # Windows toasts are delivered through a tray icon; without one
+        # showMessage() silently does nothing on recent Windows versions.
+        self.tray = QSystemTrayIcon(self.windowIcon())
+        self.tray.setToolTip("MC 汉化器")
+        self.tray.show()
 
         ensure_page_icon()
         root = QWidget()
@@ -100,6 +118,17 @@ class HtmlMainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        # Drops are accepted at the window AND at the application level. The
+        # frameless layout puts the web view under the whole window, and on some
+        # Windows builds a drop lands on the internal RenderWidgetHostViewQtDelegate
+        # child instead of the QMainWindow — that child has acceptDrops() false, so
+        # the drag died before any dragEnterEvent reached the window. setAcceptDrops
+        # on the child plus this filter is what makes dropping files work.
+        self.setAcceptDrops(True)
+        self.view.setAcceptDrops(True)
+        for child in self.view.findChildren(QWidget):
+            child.setAcceptDrops(True)
+        self._drop_hovering = False
         self.view.loadFinished.connect(self._on_page_loaded)
         self.view.titleChanged.connect(self._on_title)
         self.view.setUrl(QUrl.fromLocalFile(str(app_page_path().resolve())))
@@ -147,10 +176,85 @@ class HtmlMainWindow(QMainWindow):
         QTimer.singleShot(0, QApplication.instance().quit)
 
     def push_snapshot(self, payload: dict) -> None:
+        """Push a state snapshot to the page, coalescing bursts.
+
+        A translation run emits an event per text group, and each snapshot
+        carries the recent log lines — measured at ~243 KB of JSON per tick.
+        Serialising that on the GUI thread and parsing it in the page, several
+        times a second, is what made the window feel stuttery: the main thread
+        was busy shipping log text instead of servicing input.
+
+        Two things keep that cheap: at most one push is in flight (only the
+        newest snapshot is kept while it is busy — a run's hundredth tick
+        matters more than its ninety-ninth, and every snapshot is complete), and
+        each pushed snapshot carries only the log lines the page has not seen.
+        Coalescing therefore cannot lose log text: the delta is computed here
+        against the cursor last *delivered*, not against the last rendered tick.
+        """
+
         payload = dict(payload)
         payload["window_maximized"] = bool(self.isMaximized())
+        # Log lines are banked as they arrive, and the page gets the bank when a
+        # snapshot actually goes out. Taking them at push time would lose the
+        # lines carried by a snapshot that a newer one replaced, and taking only
+        # the newest snapshot's tail would lose anything older than that tail.
+        self._bank_logs(payload.get("logs"))
+        self._pending_snapshot = payload
+        if self._snapshot_in_flight:
+            return
+        self._flush_snapshot()
+
+    def _bank_logs(self, logs: object) -> None:
+        bank_logs(logs, self._pending_logs, self._pending_log_ids, self._delivered_log_ids, LOG_PENDING_MAX)
+
+    def _with_log_delta(self, payload: dict) -> dict:
+        """Replace the snapshot's log tail with the banked, not-yet-sent lines."""
+
+        if not isinstance(payload.get("log_revision"), int) and not self._pending_logs:
+            return payload
+        payload["logs"] = list(self._pending_logs)
+        self._pending_logs = []
+        self._delivered_log_ids |= self._pending_log_ids
+        self._pending_log_ids = set()
+        if len(self._delivered_log_ids) > 8000:
+            # Bound the identity set. The page keeps 2000 lines and the
+            # controller 2000 more, so a few thousand ids is ample headroom.
+            self._delivered_log_ids = set(
+                str(entry.get("id")) for entry in payload["logs"][-1000:] if isinstance(entry, dict)
+            )
+        return payload
+
+    def _flush_snapshot(self) -> None:
+        payload = self._pending_snapshot
+        if payload is None or self._closing:
+            return
+        self._pending_snapshot = None
+        self._snapshot_in_flight = True
+        payload = self._with_log_delta(payload)
         encoded = json.dumps(payload, ensure_ascii=False)
-        self.view.page().runJavaScript(f"applySnapshot({encoded})")
+        self.view.page().runJavaScript(f"applySnapshot({encoded})", self._on_snapshot_applied)
+
+    def _on_snapshot_applied(self, _result: object = None) -> None:
+        self._snapshot_in_flight = False
+        if self._pending_snapshot is not None:
+            self._flush_snapshot()
+
+    def set_page_zoom(self, factor: float) -> float:
+        """Scale the whole page proportionally, like a browser's zoom.
+
+        WebEngine's zoom factor scales layout, fonts and the interaction points
+        together (devicePixelRatio rises with it), so the page keeps its
+        proportions instead of stretching one region.
+        """
+
+        clamped = clamp_zoom(factor)
+        self._page_zoom = clamped
+        self.view.setZoomFactor(clamped)
+        self.push_snapshot(self.controller.snapshot(ok=True))
+        return clamped
+
+    def _zoom_step(self, delta: float) -> None:
+        self.set_page_zoom(self._page_zoom + delta)
 
     def _start_system_move(self) -> None:
         # PySide6 exposes the system move/resize loops on QWindow only.
@@ -172,6 +276,14 @@ class HtmlMainWindow(QMainWindow):
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         etype = event.type()
+        # Ctrl+wheel zooms the whole page. WebEngine consumes plain-wheel scroll
+        # itself; only the Ctrl chord needs to be claimed here.
+        if etype == QEvent.Type.Wheel and not self._closing and isinstance(event, QWheelEvent):
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                steps = event.angleDelta().y() / 120.0
+                if steps:
+                    self._zoom_step(0.1 * steps)
+                    return True
         if etype in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick) and not self._closing:
             if (
                 isinstance(obj, QWidget)
@@ -190,6 +302,7 @@ class HtmlMainWindow(QMainWindow):
                     last_y=last_y,
                     seconds_since_last=now - last_time if last_time else 0.0,
                     double_click=etype == QEvent.Type.MouseButtonDblClick,
+                    scale=self._page_zoom,
                 )
                 if action == "none":
                     # Page content: double clicks stay with the WebEngine (A09).
@@ -204,7 +317,72 @@ class HtmlMainWindow(QMainWindow):
                     else:
                         self.showMaximized()
                 return True
+        # Drop events arrive on whichever widget the OS hands them to. The view's
+        # internal render child does not forward them to QMainWindow on every
+        # Windows build, so they are handled here for any widget of this window.
+        if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.DragLeave, QEvent.Type.Drop):
+            if isinstance(obj, QWidget) and (obj is self.view or self.view.isAncestorOf(obj) or obj is self):
+                if self._route_drop_event(obj, event):
+                    return True
         return super().eventFilter(obj, event)
+
+    def _route_drop_event(self, widget: QWidget, event: QEvent) -> bool:
+        """Handle one drag/drop stage for a widget, returning True when consumed."""
+
+        mime = getattr(event, "mimeData", lambda: None)()
+        if mime is None or not mime.hasUrls():
+            return False
+        paths = [Path(url.toLocalFile()) for url in mime.urls()]
+        paths = [path for path in paths if path.exists()]
+        etype = event.type()
+        if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            if not paths:
+                return False
+            event.acceptProposedAction()
+            if etype == QEvent.Type.DragEnter or not self._drop_hovering:
+                self._drop_hovering = True
+                self._set_drop_feedback(paths)
+            return True
+        if etype == QEvent.Type.DragLeave:
+            self._drop_hovering = False
+            self.run_js("applyDropState('idle', '')")
+            event.accept()
+            return True
+        # Drop
+        self._drop_hovering = False
+        self.run_js("applyDropState('idle', '')")
+        if not paths:
+            return False
+        event.acceptProposedAction()
+        self._handle_dropped_paths(paths)
+        return True
+
+    def _handle_dropped_paths(self, paths: list[Path]) -> None:
+        """A drop fills the queue; it only claims the input slot while that slot is empty.
+
+        2026-09-24: single-file drops used to replace the current input whenever
+        the app was idle, so dragging three packs in a row silently kept only the
+        last one.  Replacing the input stays on the「选择资源」button — an explicit
+        act — while dragging always means "line this behind what I chose".
+        """
+
+        to_input, _to_queue = drop_plan(
+            has_input=self.controller.input_path is not None,
+            busy=self.controller.busy,
+            count=len(paths),
+            has_queue=bool(self.controller.queue),
+        )
+        if to_input:
+            first = self.controller.set_input(paths[0])
+            self.push_snapshot(first)
+            if not first.get("ok"):
+                # An unusable first path is not silently dropped either: the batch
+                # reports why it did not land.
+                self.push_snapshot(self.controller.enqueue_paths(paths))
+                return
+            paths = paths[1:]
+        if paths:
+            self.push_snapshot(self.controller.enqueue_paths(paths))
 
     def handle_command(self, payload: dict) -> dict:
         command = str(payload.get("command") or "")
@@ -225,6 +403,12 @@ class HtmlMainWindow(QMainWindow):
         if command == "window_move":
             if not self.isMaximized():
                 self._start_system_move()
+            return self.controller.snapshot(ok=True)
+        if command == "window_zoom":
+            self.set_page_zoom(float(payload.get("factor") or self._page_zoom))
+            return self.controller.snapshot(ok=True)
+        if command == "window_zoom_step":
+            self._zoom_step(float(payload.get("delta") or 0))
             return self.controller.snapshot(ok=True)
         if command == "window_resize":
             edge = RESIZE_EDGES.get(str(payload.get("edge") or ""))
@@ -252,8 +436,30 @@ class HtmlMainWindow(QMainWindow):
             return self._start_translation(resume=bool(payload.get("resume")))
         if command == "stop":
             return self._stop()
-        if command == "reset":
-            return self.controller.reset_task()
+        if command == "enqueue_task":
+            raw_path = str(payload.get("path") or "").strip().strip('"')
+            if not raw_path:
+                return self.controller.snapshot(ok=False, error="缺少要排队的路径。")
+            return self.controller.enqueue_task(Path(raw_path))
+        if command == "choose_enqueue":
+            return self._choose_enqueue()
+        if command == "queue_remove":
+            return self.controller.queue_remove(int(payload.get("index") or 0))
+        if command == "queue_clear":
+            return self.controller.queue_clear()
+        if command == "start_next":
+            # 完成态下队列的显式启动入口（用户可能是在上一个任务跑完之后才拖入
+            # 新包的，那种情况不会再有完成回调来推进队列）。
+            return self._start_next_queued()
+        if command == "set_auto_continue":
+            return self.controller.set_auto_continue(bool(payload.get("enabled")))
+        if command == "set_notify":
+            system = payload.get("system")
+            sound = payload.get("sound")
+            return self.controller.set_notify(
+                system=None if system is None else bool(system),
+                sound=None if sound is None else bool(sound),
+            )
         if command == "save_revision":
             return self.controller.save_revision(str(payload.get("id") or ""), str(payload.get("target") or ""))
         if command == "save_draft":
@@ -442,10 +648,13 @@ class HtmlMainWindow(QMainWindow):
         if output_path.exists() and not resume:
             return self.controller.snapshot(ok=False, error="输出路径已存在，请更改文件名。", toast="输出路径已存在，请更改文件名。")
         from mc_hanhua.gui_workers import TranslationWorker
-        from mc_hanhua.translator import OpenAICompatibleTranslator
+        from mc_hanhua.translator import translator_class_for
 
+        # The provider decides how a candidate is produced; whether a candidate
+        # may be written stays the one shared validation gate either way.
+        provider_class = translator_class_for(self.controller.provider())
         translator = (
-            OpenAICompatibleTranslator(
+            provider_class(
                 api_key=self.controller.api_key,
                 base_url=self.controller.base_url(),
                 model=self.controller.model(),
@@ -458,6 +667,7 @@ class HtmlMainWindow(QMainWindow):
         self.controller.stop_requested = False
         self.controller.state = "translating"
         self.controller.current_request_id = uuid4().hex
+        self.controller.mark_task_started()
         options = self.controller.translation_options()
         self.worker = TranslationWorker(input_path, output_path, translator, self.controller.max_ai(), options=options, resume=resume or self.controller.resume_pending)
         self.worker.records_loaded.connect(self._on_records)
@@ -482,13 +692,72 @@ class HtmlMainWindow(QMainWindow):
         self.push_snapshot(self.controller.on_progress(event))
 
     def _on_completed(self, report) -> None:
-        self.push_snapshot(self.controller.on_completed(report))
+        snapshot = self.controller.on_completed(report)
+        self.push_snapshot(snapshot)
+        self._maybe_notify(snapshot)
+        if queue_advance(
+            str(snapshot.get("state") or ""),
+            auto_continue=self.controller.auto_continue,
+            has_queue=bool(self.controller.queue),
+        ) == "next":
+            QTimer.singleShot(0, self._start_next_queued)
 
     def _on_failed(self, message: str, log_path: str) -> None:
-        self.push_snapshot(self.controller.on_failed(message, log_path))
+        snapshot = self.controller.on_failed(message, log_path)
+        self.push_snapshot(snapshot)
+        self._maybe_notify(snapshot)
 
     def _on_paused(self, message: str, log_path: str) -> None:
-        self.push_snapshot(self.controller.on_paused(message, log_path))
+        snapshot = self.controller.on_paused(message, log_path)
+        self.push_snapshot(snapshot)
+        self._maybe_notify(snapshot)
+
+    def _maybe_notify(self, snapshot: dict) -> None:
+        """System-side completion feedback: only when the user is not looking."""
+
+        notify = snapshot.get("notify") or {}
+        if not notify or self._closing:
+            return
+        if self.isActiveWindow() and not self.isMinimized():
+            return
+        if self.controller.notify_system_enabled():
+            try:
+                self.tray.showMessage(
+                    str(notify.get("title") or "MC 汉化器"),
+                    str(notify.get("body") or ""),
+                    QSystemTrayIcon.Information,
+                    6000,
+                )
+            except Exception:
+                pass
+        QApplication.alert(self)
+        if self.controller.notify_sound_enabled():
+            QApplication.beep()
+
+    def _start_next_queued(self) -> dict:
+        entry, snapshot = self.controller.claim_queue_head()
+        if entry is None:
+            # 没取出条目就一定没有启动：把原因推给页面，队列与当前输入保持原样。
+            self.push_snapshot(snapshot)
+            return snapshot
+        self.controller._log(f"队列继续：{entry.get('name')}（剩余 {len(self.controller.queue)} 个）")
+        started = self._start_translation()
+        if not started.get("ok"):
+            started = self.controller.on_failed(str(started.get("error") or "队列任务启动失败"))
+        self.push_snapshot(started)
+        return started
+
+    def _choose_enqueue(self) -> dict:
+        files, _ = QFileDialog.getOpenFileNames(self, "选择要排队的文件", "", "Minecraft archives (*.zip *.jar *.mrpack);;All files (*.*)")
+        if files:
+            snapshot = None
+            for item in files:
+                snapshot = self.controller.enqueue_task(Path(item))
+            return snapshot or self.controller.snapshot(ok=True)
+        folder = QFileDialog.getExistingDirectory(self, "选择要排队的地图或整合包目录")
+        if folder:
+            return self.controller.enqueue_task(Path(folder))
+        return self.controller.snapshot(ok=True)
 
     def _on_records(self, payload) -> None:
         self.push_snapshot(self.controller.load_report_records(payload))
@@ -516,6 +785,7 @@ class HtmlMainWindow(QMainWindow):
 
         self.controller.busy = True
         self.controller.state = "translating"
+        self.controller.mark_task_started()
         self.worker = TranslationWorker(Path(manifest.input_path), target, GlossaryOnlyTranslator(), 0, options=options)
         self.worker.records_loaded.connect(self._on_records)
         self.worker.progress.connect(self._on_progress)
@@ -552,17 +822,69 @@ class HtmlMainWindow(QMainWindow):
         if request.start_immediately and request.input_path and request.input_path.exists():
             self._start_translation()
 
+    def _set_drop_feedback(self, paths: list[Path]) -> None:
+        """Tell the page what a drop would do, since it cannot see the drag itself.
+
+        The window accepts the drop, so the web view never receives dragover or
+        dragleave: without this the drop zone could not highlight. The hint
+        states the outcome up front so the user knows whether the input is
+        claimed or queued before releasing — it reads the same ``drop_plan`` the
+        drop itself uses, so the promise and the result cannot drift apart.
+        """
+
+        if not paths:
+            self.run_js("applyDropState('idle', '')")
+            return
+        has_input = self.controller.input_path is not None
+        has_queue = bool(self.controller.queue)
+        to_input, _to_queue = drop_plan(
+            has_input=has_input, busy=self.controller.busy, count=len(paths), has_queue=has_queue
+        )
+        if to_input:
+            if len(paths) == 1:
+                detail = f"松开后设为当前输入 · 点击开始后处理：{paths[0].name}"
+            else:
+                detail = f"松开后：1 个设为当前输入，另外 {len(paths) - 1} 个加入队列"
+            self.run_js(f"applyDropState('over', {json.dumps(detail, ensure_ascii=False)})")
+            return
+        names = "、".join(path.name for path in paths[:3])
+        more = f" 等 {len(paths)} 个" if len(paths) > 3 else ""
+        if self.controller.busy:
+            prefix = "松开后加入队列 · 不影响正在运行的任务："
+        elif has_input:
+            current = self.controller.input_path
+            prefix = f"松开后加入队列 · 保留当前输入 {current.name}：" if current else "松开后加入队列："
+        else:  # pragma: no cover - an idle, empty input slot already returned above
+            prefix = "松开后加入队列："
+        self.run_js(f"applyDropState('queue', {json.dumps(prefix + names + more, ensure_ascii=False)})")
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        # Delegated to the shared path so the window hooks and the application
+        # filter cannot drift apart; a drop may arrive through either.
+        self._route_drop_event(self, event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        self._route_drop_event(self, event)
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        # Without this the highlight stays on after the pointer leaves, because
+        # the page never sees a dragleave of its own.
+        self._drop_hovering = False
+        self.run_js("applyDropState('idle', '')")
+        event.accept()
+
+    def run_js(self, source: str) -> None:
+        """Run a snippet in the page, ignoring a view that is not ready yet."""
+
+        if self._closing:
+            return
+        try:
+            self.view.page().runJavaScript(source)
+        except RuntimeError:
+            pass
 
     def dropEvent(self, event: QDropEvent) -> None:
-        for url in event.mimeData().urls():
-            path = Path(url.toLocalFile())
-            if path.exists():
-                self.push_snapshot(self.controller.set_input(path))
-                event.acceptProposedAction()
-                return
+        self._route_drop_event(self, event)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         worker = self.scan_worker if self.scan_worker is not None and self.scan_worker.isRunning() else self.worker
@@ -583,6 +905,10 @@ class HtmlMainWindow(QMainWindow):
             return
         try:
             self.controller.save_config()
+        except Exception:
+            pass
+        try:
+            self.tray.hide()
         except Exception:
             pass
         app = QApplication.instance()
@@ -622,6 +948,7 @@ class HtmlMainWindow(QMainWindow):
 
         self.controller.busy = True
         self.controller.state = "translating"
+        self.controller.mark_task_started()
         self.controller.status_title = "重新审计"
         self.controller.status_desc = "不调用翻译接口，仅重新审计并打包已暂存译文。"
         self.worker = ReauditWorker(workspace, output_path)

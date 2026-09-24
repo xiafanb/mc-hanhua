@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "note": "机制骨架审计的函数实参例外表（W4）。只有被审阅确认为「显示用途」的实参才可出现在这里；未列出的实参一旦在写回后被改写即阻断发布。条目按（函数 ID, 实参名）精确匹配，不含通配。",
+  "function_arguments": [
+    {
+      "function": "uty:typewriter/start_writer",
+      "argument": "dialog",
+      "reason": "打字机对话正文：该实参在 start_writer 内只流入显示载荷（写给 storage 后由打字机逐字显示），不含机制用途。",
+      "evidence": "docs/diagnostics/MAP_DEFECT_TRIAGE_2026-09-18.md §3；实机存档 22/22 调用提取、写回读回一致"
+    }
+  ]
+}

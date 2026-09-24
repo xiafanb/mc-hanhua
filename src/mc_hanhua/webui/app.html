@@ -7,151 +7,276 @@
   <link rel="stylesheet" href="design-base.css">
   <link rel="stylesheet" href="design-overlay.css">
   <link rel="stylesheet" href="layout-fit.css">
+  <link rel="stylesheet" href="runtime.css">
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 </head>
 <body>
-  <div class="app">
-    <header class="titlebar" id="titlebar">
-      <img class="tb-icon" src="tubiao.png" alt="">
-      <span class="tb-title">MC 汉化器</span>
-      <div class="tb-actions">
-        <button type="button" id="winMin" aria-label="最小化" title="最小化">
-          <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5.5h8" stroke="currentColor" stroke-width="1" fill="none"/></svg>
-        </button>
-        <button type="button" id="winMax" aria-label="最大化" title="最大化 / 还原">
-          <svg class="ico-max" viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" stroke="currentColor" stroke-width="1" fill="none"/></svg>
-          <svg class="ico-restore" viewBox="0 0 10 10" aria-hidden="true"><rect x="3.5" y="1.5" width="5" height="5" stroke="currentColor" stroke-width="1" fill="none"/><rect x="1.5" y="3.5" width="5" height="5" stroke="currentColor" stroke-width="1" fill="#f4f8ec"/></svg>
-        </button>
-        <button type="button" id="winClose" class="tb-close" aria-label="关闭" title="关闭">
-          <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1" fill="none"/></svg>
-        </button>
+<div class="app">
+  <header class="titlebar" id="titlebar">
+    <img class="tb-icon" src="tubiao.png" alt="">
+    <span>MC 汉化器</span>
+    <div class="tb-actions">
+      <button type="button" id="winMin" title="最小化" aria-label="最小化">
+        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5.5h8" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
+      </button>
+      <button type="button" id="winMax" title="最大化 / 还原" aria-label="最大化">
+        <svg class="ico-max" viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
+        <svg class="ico-restore" viewBox="0 0 10 10" aria-hidden="true"><rect x="3.5" y="1.5" width="5" height="5" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="1.5" y="3.5" width="5" height="5" stroke="currentColor" stroke-width="1.3" fill="#f4f8f0"/></svg>
+      </button>
+      <button type="button" id="winClose" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- 左栏 -->
+    <section class="panel left">
+      <div class="topline">
+        <h2>翻译任务</h2>
+        <button type="button" id="openConnection">连接控制</button>
       </div>
-    </header>
-    <div class="layout">
-      <section class="panel">
-        <div class="topline">
-          <h2>翻译任务</h2>
-          <button type="button" id="openConnection">连接控制</button>
-        </div>
-        <p class="hint">选择输入源，开始资源本地化</p>
-        <div class="task-body">
-        <h3>输入资源</h3>
-        <div class="drop">
-          <div class="plus">＋</div>
-          <div style="min-width:0">
-            <strong id="filename">尚未选择输入资源</strong>
-            <span id="inputDetail">支持 zip / jar / mrpack，以及地图或整合包目录</span>
+      <p class="hint">选择输入源，开始资源本地化</p>
+
+      <div class="segmented" role="tablist" aria-label="任务视图">
+        <button type="button" class="active" id="modeSingle" role="tab" aria-selected="true" aria-controls="viewSingle">当前任务</button>
+        <button type="button" id="modeQueue" role="tab" aria-selected="false" aria-controls="viewQueue">汉化队列 <span class="count" id="queueBadge" hidden>0</span></button>
+      </div>
+
+      <!-- 视图 A：当前任务 -->
+      <div id="viewSingle" style="display:flex;flex-direction:column;gap:14px;">
+        <div class="drop" id="dropZone">
+          <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <div class="drop-title" id="filename">拖拽文件至此处，或点击选择</div>
+          <div class="drop-sub" id="inputDetail">支持 zip / jar / mrpack，以及地图或整合包目录</div>
+          <div class="drop-tip" id="dropHint"></div>
+          <div class="drop-actions">
+            <button type="button" id="choose">选择资源</button>
+            <button type="button" id="enqueue" title="加入队列">加入队列</button>
           </div>
-          <button class="ghost" type="button" id="choose">选择资源</button>
         </div>
-        <h3>输出位置</h3>
-        <div class="path">
-          <input id="out" aria-label="输出位置" placeholder="选择资源后自动生成">
+
+        <div class="field-row">
+          <span class="field-label">输出</span>
+          <input id="out" type="text" aria-label="输出位置" placeholder="选择资源后自动生成">
           <button type="button" id="changeOut">更改</button>
         </div>
-        <details id="prefs">
-          <summary>翻译偏好</summary>
-          <label><input type="checkbox" id="npc" checked> 安全时翻译商人 / NPC 标签</label>
-          <p class="hint">仅影响安全可译标签；机制锁定和未知项始终保留。</p>
-        </details>
-        <div class="start">
-          <strong id="status">等待开始</strong>
-          <p id="desc">选择输入资源后即可开始</p>
-          <div class="meter" role="progressbar" aria-label="任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-            <div class="bar"><i id="fill"></i></div>
-            <span id="percent">0%</span>
-          </div>
-          <div id="stages">准备 · 扫描 · 翻译与审校 · 写回审计 · 打包</div>
-          <div class="buttons">
-            <button id="scan" type="button" disabled>仅扫描预览</button>
-            <button id="run" type="button" disabled>开始汉化</button>
-          </div>
-        </div>
-        <div class="stats">
-          <div class="stat"><span>扫描文本总数</span><b id="count">0</b></div>
-          <div class="stat"><span>已处理文本组</span><b id="groups">0</b></div>
-          <div class="stat"><span>AI 自动通过</span><b id="passed">0</b></div>
-          <div class="stat"><span>待复审问题</span><b id="issues">0</b></div>
-        </div>
-        </div>
-        <div class="bottom-actions">
-          <button type="button" id="reset">重置任务</button>
-          <button type="button" id="openHistory">最近任务</button>
-          <button type="button" id="openSummary">查看质量摘要</button>
-        </div>
-      </section>
-      <section class="panel right">
-        <div class="loghead">
-          <h2>任务详情</h2>
-          <small>进度、内容与问题集中查看</small>
-        </div>
-        <nav role="tablist" aria-label="任务详情">
-          <button type="button" role="tab" aria-selected="true" aria-controls="content" data-tab="logs" class="active" id="tabLogs">处理日志</button>
-          <button type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="-1" data-tab="preview" id="tabPreview">扫描预览</button>
-          <button type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="-1" data-tab="review" id="tabReview">问题审阅 <span id="badge">0</span></button>
-        </nav>
-        <div class="toolbar">
-          <input id="search" class="search" aria-label="搜索记录" placeholder="搜索原文、译文或原因…">
-          <select id="logLevel" aria-label="日志级别">
-            <option value="all">全部级别</option>
-            <option value="info">INFO</option>
-            <option value="warning">WARN</option>
-            <option value="error">ERROR</option>
-          </select>
-          <select id="filter" aria-label="内容类型" hidden>
-            <option value="all">全部内容</option>
-            <option value="display">可翻译</option>
-            <option value="lock">机制锁定</option>
-            <option value="unknown">待确认</option>
-          </select>
-        </div>
-        <div class="log-columns" id="logColumns" aria-hidden="true"><span>时间</span><span>级别</span><span>处理内容</span></div>
-        <div id="content" role="tabpanel" aria-labelledby="tabLogs" tabindex="0"></div>
-        <div class="record-footer"><span id="recordCount">0 条日志</span><label id="followLabel"><input type="checkbox" id="followLogs" checked>跟随最新日志</label></div>
-      </section>
-    </div>
-    <footer class="footer"><span id="taskState">等待开始</span><span id="connectionState">本地词库模式</span></footer>
-  </div>
-  <dialog id="connection">
-    <h2>连接控制</h2>
-    <p>配置兼容 API、可用模型和稳定请求策略。密钥不会写入日志。</p>
-    <label>API 地址<input id="connUrl" placeholder="https://example.com/v1"></label>
-    <label>API Key<input id="connKey" type="password" placeholder="留空时仅使用本地词库"></label>
-    <label><input id="connRemember" type="checkbox"> 安全记住 API Key</label>
-    <label class="model-caption">模型</label>
-    <div class="model-row">
-      <div class="model-field">
-        <input id="connModel" value="mimo-v2.5" aria-label="模型" autocomplete="off" spellcheck="false">
-        <button type="button" id="modelToggle" class="ghost" aria-label="展开模型列表" title="展开模型列表">
-          <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 3.5L5 7l3.5-3.5" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
-        </button>
-        <div id="modelList" class="model-list" hidden></div>
       </div>
-      <button type="button" id="fetchModels" class="ghost">拉取模型</button>
+
+      <!-- 视图 B：汉化队列 -->
+      <div id="viewQueue" class="card queue" style="display:none;padding:0;">
+        <div class="queue-head">
+          <span class="sum" id="queueSummary">队列中共有 0 个任务</span>
+          <label class="check" title="任务完成后自动开始下一个排队任务"><input type="checkbox" id="autoContinue" checked><span>自动继续</span></label>
+          <button type="button" id="startQueue" title="开始处理队列中的第一个任务">开始下一个</button>
+          <button type="button" id="clearQueue">清空</button>
+        </div>
+        <ul class="queue-list" id="queueList"></ul>
+      </div>
+
+      <!-- 执行卡 -->
+      <div class="card">
+        <div class="card-title" id="status">等待开始</div>
+        <p class="card-desc" id="desc">选择输入资源后即可开始</p>
+        <div class="card-metrics" id="metrics" hidden><span id="metricsText" hidden></span></div>
+        <div class="progress" role="progressbar" aria-label="任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="track"><i id="fill"></i></div>
+          <span class="value" id="percent">0%</span>
+        </div>
+        <div class="stages" id="stages">准备 · 扫描 · 翻译与审校 · 写回审计 · 打包</div>
+        <div class="actions">
+          <button type="button" id="scan" disabled>仅扫描预览</button>
+          <button type="button" id="run" class="primary" disabled>开始汉化</button>
+        </div>
+      </div>
+
+      <div class="stats">
+        <div class="stat" title="扫描期发现的全部文本条目"><span>扫描文本总数</span><b id="count">0</b></div>
+        <div class="stat" title="已处理结束的文本组，可能包含失败组；与「已翻译文本」口径不同"><span>已处理文本组</span><b id="groups">0</b></div>
+        <div class="stat" title="最终译文与原文不同的文本数，含 AI、词库、记忆与手工修订；写回校验拒绝时会回落"><span>已翻译文本</span><b id="passed">0</b></div>
+        <div class="stat" title="扫描期未审计字段，加运行期校验失败与服务错误"><span>待复审问题</span><b id="issues">0</b></div>
+      </div>
+
+      <div class="links">
+        <button type="button" id="openPrefs">翻译偏好</button>
+        <span class="sep">·</span>
+        <button type="button" id="openHistory">最近任务</button>
+        <span class="sep">·</span>
+        <button type="button" id="openSummary">质量摘要</button>
+      </div>
+    </section>
+
+    <!-- 右栏 -->
+    <section class="panel right">
+      <div class="loghead">
+        <h2>任务详情</h2>
+        <small>进度、内容与问题集中查看</small>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="任务详情">
+        <button type="button" class="active" data-tab="logs" role="tab" aria-selected="true" aria-controls="content" id="tabLogs">处理日志</button>
+        <button type="button" data-tab="preview" role="tab" aria-selected="false" aria-controls="content" tabindex="-1" id="tabPreview">扫描预览</button>
+        <button type="button" data-tab="review" role="tab" aria-selected="false" aria-controls="content" tabindex="-1" id="tabReview">问题审阅 <span class="count" id="badge">(0)</span></button>
+      </nav>
+
+      <div id="banner" class="banner" hidden>
+        <div><b id="bannerTitle"></b><p id="bannerBody"></p></div>
+        <button type="button" id="bannerClose">知道了</button>
+      </div>
+
+      <div class="toolbar">
+        <input class="search" id="search" type="text" aria-label="搜索记录" placeholder="搜索原文、译文或原因…">
+        <select id="logLevel" aria-label="日志级别">
+          <option value="all">全部级别</option>
+          <option value="info">INFO</option>
+          <option value="warning">WARN</option>
+          <option value="error">ERROR</option>
+        </select>
+        <select id="filter" aria-label="内容类型" hidden>
+          <option value="all">全部内容</option>
+          <option value="display">可翻译</option>
+          <option value="lock">机制锁定</option>
+          <option value="unknown">待确认</option>
+          <option value="runtime">运行期</option>
+        </select>
+      </div>
+
+      <div class="records" id="content" role="tabpanel" aria-labelledby="tabLogs" tabindex="0"></div>
+
+      <div class="records-foot">
+        <span id="recordCount">显示 0 / 0 条日志</span>
+        <label class="check" id="followLabel"><input type="checkbox" id="followLogs" checked><span>跟随最新日志</span></label>
+      </div>
+    </section>
+  </div>
+
+  <footer class="footer">
+    <span id="taskState">等待开始</span>
+    <span id="connectionState">本地词库模式</span>
+  </footer>
+</div>
+
+<!-- 连接控制 -->
+<dialog id="connection">
+  <div class="dlg-head">
+    <h3>连接控制</h3>
+    <p>配置兼容 API、可用模型与稳定请求策略。密钥经系统加密保存，不写入日志。</p>
+  </div>
+  <div class="dlg-body">
+    <div class="form-row">
+      <label for="connUrl">API 地址</label>
+      <input id="connUrl" type="text" placeholder="https://example.com/v1">
     </div>
-    <small id="modelStatus"></small>
-    <label>并发数<input id="connWorkers" type="number" value="1" min="1" max="6"></label>
-    <details>
+
+    <div class="form-row">
+      <label for="connKey">API Key</label>
+      <input id="connKey" type="password" placeholder="留空时仅使用本地词库">
+      <label class="check" style="margin-top:2px;"><input type="checkbox" id="connRemember"><span>安全记住 API Key</span></label>
+    </div>
+
+    <div class="form-row">
+      <label for="connProvider">模型类型</label>
+      <select id="connProvider">
+        <option value="chat">通用对话模型</option>
+        <option value="qwen-mt">Qwen-MT 专用翻译模型</option>
+      </select>
+      <p class="note" id="providerHint"></p>
+    </div>
+
+    <div class="form-row">
+      <label for="connModel">模型</label>
+      <div class="inline">
+        <div class="model-picker">
+          <input id="connModel" type="text" value="mimo-v2.5" autocomplete="off" spellcheck="false">
+          <button type="button" class="toggle" id="modelToggle" title="展开模型列表" aria-label="展开模型列表">
+            <svg viewBox="0 0 10 10" width="11" height="11" aria-hidden="true"><path d="M1.6 3.4L5 6.8l3.4-3.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+          </button>
+          <div class="model-list" id="modelList" hidden></div>
+        </div>
+        <button type="button" id="fetchModels">拉取模型</button>
+      </div>
+      <p class="note" id="modelStatus"></p>
+    </div>
+
+    <div class="form-row">
+      <label for="connWorkers">并发数</label>
+      <input id="connWorkers" type="number" value="1" min="1" max="6">
+    </div>
+
+    <details class="section">
       <summary>扩展项</summary>
-      <label>最大 AI 翻译文本组数<input id="connMaxAi" type="number" value="0" min="0"></label>
+      <div class="body">
+        <div class="form-row">
+          <label for="connMaxAi">最大 AI 翻译文本组数</label>
+          <input id="connMaxAi" type="number" value="0" min="0">
+        </div>
+        <div class="form-grid">
+          <div class="form-row">
+            <label for="connPriceIn">输入单价（每百万 Token）</label>
+            <input id="connPriceIn" type="number" placeholder="留空不估算">
+          </div>
+          <div class="form-row">
+            <label for="connPriceOut">输出单价（每百万 Token）</label>
+            <input id="connPriceOut" type="number" placeholder="留空不估算">
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="connCurrency">币种</label>
+          <select id="connCurrency">
+            <option value="CNY">¥ 人民币</option>
+            <option value="USD">$ 美元</option>
+          </select>
+        </div>
+      </div>
     </details>
-    <button type="button" id="closeConnection">应用并关闭</button>
-  </dialog>
-  <dialog id="historyDialog">
-    <h2>最近任务</h2>
-    <div id="historyText">还没有任务。请先选择资源。</div>
-    <button type="button" id="closeHistory">返回任务</button>
-  </dialog>
-  <dialog id="summary">
-    <h2>质量摘要</h2>
-    <div id="summaryText"></div>
-    <button type="button" id="closeSummary">关闭</button>
-  </dialog>
-  <div class="rz n" data-edge="n"></div><div class="rz s" data-edge="s"></div>
-  <div class="rz e" data-edge="e"></div><div class="rz w" data-edge="w"></div>
-  <div class="rz ne" data-edge="ne"></div><div class="rz nw" data-edge="nw"></div>
-  <div class="rz se" data-edge="se"></div><div class="rz sw" data-edge="sw"></div>
-  <div id="toast" role="status"></div>
-  <script src="app.js"></script>
+  </div>
+  <div class="dlg-foot">
+    <button type="button" class="primary" id="closeConnection">应用并关闭</button>
+  </div>
+</dialog>
+
+<!-- 翻译偏好 -->
+<dialog id="prefsDialog">
+  <div class="dlg-head">
+    <h3>翻译偏好</h3>
+    <p>影响汉化运行时的词条处理与任务提醒；机制锁定与未知项始终保留原文。</p>
+  </div>
+  <div class="dlg-body">
+    <label class="check"><input type="checkbox" id="npc" checked><span>安全时翻译商人 / NPC 标签</span></label>
+    <label class="check"><input type="checkbox" id="notifySystem" checked><span>任务完成时发送系统通知</span></label>
+    <label class="check"><input type="checkbox" id="notifySound"><span>任务完成时播放提示音</span></label>
+  </div>
+  <div class="dlg-foot"><button type="button" class="primary" id="closePrefs">完成</button></div>
+</dialog>
+
+<!-- 最近任务 -->
+<dialog id="historyDialog">
+  <div class="dlg-head">
+    <h3>最近任务</h3>
+    <p>保留最近完成或中断的任务，可直接回到其中一次继续查看。</p>
+  </div>
+  <div class="dlg-body"><div class="dialog-list" id="historyText"></div></div>
+  <div class="dlg-foot"><button type="button" id="closeHistory">返回任务</button></div>
+</dialog>
+
+<!-- 质量摘要 -->
+<dialog id="summaryDialog">
+  <div class="dlg-head">
+    <h3>质量摘要</h3>
+    <p>本次任务的扫描、翻译与审计结果；发布被阻止时会列出阻断项。</p>
+  </div>
+  <div class="dlg-body"><div class="dialog-list" id="summaryText"></div></div>
+  <div class="dlg-foot"><button type="button" id="closeSummary">关闭</button></div>
+</dialog>
+
+<div class="rz n" data-edge="n"></div><div class="rz s" data-edge="s"></div>
+<div class="rz e" data-edge="e"></div><div class="rz w" data-edge="w"></div>
+<div class="rz ne" data-edge="ne"></div><div class="rz nw" data-edge="nw"></div>
+<div class="rz se" data-edge="se"></div><div class="rz sw" data-edge="sw"></div>
+<div class="toast" id="toast" role="status"></div>
+<script src="app.js"></script>
 </body>
 </html>

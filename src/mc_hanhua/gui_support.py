@@ -9,6 +9,8 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
+from .translator import models_endpoint
+
 
 def sanitize_ssl_keylog_env() -> str:
     """Neutralise an unwritable SSLKEYLOGFILE inherited from the environment.
@@ -68,12 +70,9 @@ def _parse_startup_request(argv: list[str]) -> StartupRequest:
 
 
 def _models_endpoint(base_url: str) -> str:
-    base = base_url.strip().rstrip("/")
-    if base.endswith("/models"):
-        return base
-    if not base.endswith("/v1"):
-        base = f"{base}/v1"
-    return f"{base}/models"
+    """Compatibility wrapper; the authoritative logic lives in translator.models_endpoint."""
+
+    return models_endpoint(base_url)
 
 
 class DATA_BLOB(ctypes.Structure):

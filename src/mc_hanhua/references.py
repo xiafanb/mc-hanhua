@@ -446,7 +446,15 @@ def can_receive_shared_target(unit: TextUnit) -> bool:
 
 
 def share_existing_canonical_targets(units: list[TextUnit]) -> int:
-    """Copy an already-known target onto same-key units that still need one."""
+    """Copy an already-known target onto same-key units that still need one.
+
+    A donor's target was validated for the *donor's* span, and an object-keyed
+    group can hold differently worded occurrences, so every recipient re-enters
+    ``quality.validate_reuse``: a target that does not satisfy the recipient's
+    own tokens is left unassigned for the normal translation path.
+    """
+
+    from .quality import validate_reuse
 
     assign_canonical_keys(units)
     shared = 0
@@ -462,7 +470,10 @@ def share_existing_canonical_targets(units: list[TextUnit]) -> int:
         target = existing[0]
         for member in members:
             if can_receive_shared_target(member):
-                member.final_target = target
+                result = validate_reuse(member, target)
+                if result.normalized is None:
+                    continue
+                member.final_target = result.normalized
                 member.metadata["canonical_role"] = "follower"
                 shared += 1
     return shared
@@ -497,7 +508,14 @@ def select_canonical_leaders(units: list[TextUnit]) -> list[TextUnit]:
 
 
 def apply_leader_targets(units: list[TextUnit]) -> tuple[int, list[dict[str, object]]]:
-    """Reuse the leader's validated target; never overwrite a different context."""
+    """Reuse the leader's validated target; never overwrite a different context.
+
+    Like ``share_existing_canonical_targets``, the target must satisfy the
+    recipient's own span before it is assigned; an object-keyed group can hold
+    occurrences whose text differs, and those are not interchangeable.
+    """
+
+    from .quality import validate_reuse
 
     assign_canonical_keys(units)
     applied = 0
@@ -524,7 +542,10 @@ def apply_leader_targets(units: list[TextUnit]) -> tuple[int, list[dict[str, obj
             for member in pending:
                 if not can_receive_shared_target(member):
                     continue
-                member.final_target = target
+                result = validate_reuse(member, target)
+                if result.normalized is None:
+                    continue
+                member.final_target = result.normalized
                 applied += 1
         elif len(by_target) == 0:
             continue

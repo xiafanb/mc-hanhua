@@ -30,6 +30,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
+from .mechanism_skeleton import audit_mechanism_skeleton, json_skeleton, mentions_click_event
 from .models import ScanResult, TextUnit
 from .nbt import (
     TAG_BYTE,
@@ -50,9 +51,26 @@ from .nbt import (
     read_region_chunks,
 )
 from .quality import clue_token_drift, container_display_risk
-from .text_components import escape_pointer_part
+from .text_components import composed_pointer, escape_pointer_part, split_encoded_component_locator
+from .utils import UNREADABLE_TEXT_ERRORS, is_os_metadata_path, read_text
 
 NBT_WARNING_PREFIX = "无法解析 NBT 文件，已跳过："
+# Upper bound on pre-write command text kept for the mechanism-skeleton audit.
+# Every .mcfunction line is captured (not only unit-bearing ones): after the
+# grammar hardening a macro-only line yields no unit at all, yet it is exactly
+# the kind of line that must not change.  Truncation is reported, never hidden.
+COMMAND_LINE_CAPTURE_CHARS = 8_000_000
+#: Separate bounded reserve for lines that build a clickable message.  The
+#: general budget bounds memory for the whole-pack comparison, but a line the
+#: write door can move a control row on must never escape the interaction audit
+#: because an earlier file filled that budget: once it is exhausted the scan
+#: keeps walking the remaining files and captures the click-event lines only.
+#: If this reserve overflows too, publication is blocked instead of the
+#: interaction check being skipped for the lines it never saw.
+COMMAND_INTERACTIVE_CAPTURE_CHARS = 2_000_000
+#: How many skipped paths are named in the report; the count is always exact.
+#: The list is a sample so a pathological pack cannot grow the baseline.
+INTERACTION_SKIP_SAMPLE_LIMIT = 20
 BOOK_PAGE_VISIBLE_WARNING_CHARS = 400
 # Book container structure checks are only performed for standalone .dat/.nbt
 # files (the most complex writer path); region files are skipped to keep the
@@ -95,7 +113,7 @@ class AuditBlockedError(Exception):
 @dataclass(slots=True)
 class AuditIssue:
     level: str  # error | warning | info
-    category: str  # structure | mechanism | function | schedule | scoreboard | team | bossbar | storage | book | writeback | selector | numeric | enum | json | nbt
+    category: str  # structure | mechanism | interaction | function | schedule | scoreboard | team | bossbar | storage | book | writeback | selector | numeric | enum | json | nbt
     file: str
     message: str
     details: dict[str, Any] = field(default_factory=dict)
@@ -167,6 +185,16 @@ class AuditBaseline:
     nbt_documents: dict[str, NbtTag] = field(default_factory=dict)
     mca_chunk_raw_sha: dict[tuple[str, int], str] = field(default_factory=dict)
     mca_chunk_docs: dict[tuple[str, int], NbtTag] = field(default_factory=dict)
+    # rel path -> line number -> pre-write line text, for every .mcfunction file
+    # (bounded).  The mechanism-skeleton audit compares these against the output.
+    command_lines: dict[str, dict[int, str]] = field(default_factory=dict)
+    command_lines_truncated: bool = False
+    #: Files whose click-event lines were not captured even by the interactive
+    #: reserve: the interaction audit cannot prove those lines unchanged, so
+    #: their presence blocks publication (see ``audit_output``).  The list is a
+    #: bounded sample; the count is what decides.
+    interaction_lines_skipped: list[str] = field(default_factory=list)
+    interaction_lines_skipped_count: int = 0
 
 
 @dataclass(slots=True)
@@ -174,6 +202,14 @@ class PackResources:
     namespaces: set[str] = field(default_factory=lambda: {"minecraft"})
     functions: set[str] = field(default_factory=set)
     function_tags: set[str] = field(default_factory=set)
+
+
+def _note_interaction_skip(baseline: AuditBaseline, rel: str) -> None:
+    """Record a file whose click-event lines did not fit the reserve (bounded)."""
+
+    baseline.interaction_lines_skipped_count += 1
+    if len(baseline.interaction_lines_skipped) < INTERACTION_SKIP_SAMPLE_LIMIT:
+        baseline.interaction_lines_skipped.append(rel)
 
 
 def take_baseline(root: Path, scan_result: ScanResult) -> AuditBaseline:
@@ -186,7 +222,7 @@ def take_baseline(root: Path, scan_result: ScanResult) -> AuditBaseline:
         if suffix == ".json":
             try:
                 payload = json.loads(path.read_text(encoding="utf-8-sig"))
-            except (OSError, json.JSONDecodeError):
+            except UNREADABLE_TEXT_ERRORS:
                 continue
             baseline.json_parseable.add(rel)
             baseline.json_documents[rel] = payload
@@ -207,6 +243,53 @@ def take_baseline(root: Path, scan_result: ScanResult) -> AuditBaseline:
         if warning.startswith(NBT_WARNING_PREFIX):
             baseline.nbt_broken.add(warning[len(NBT_WARNING_PREFIX) :].split("（", 1)[0])
 
+    captured_chars = 0
+    interactive_chars = 0
+    for path in _iter_files(root):
+        if path.suffix.lower() != ".mcfunction":
+            continue
+        rel = path.relative_to(root).as_posix()
+        capture_all = captured_chars < COMMAND_LINE_CAPTURE_CHARS
+        try:
+            lines = read_text(path).splitlines()
+        except UNREADABLE_TEXT_ERRORS:
+            continue
+        if capture_all:
+            # The general budget is charged per file, exactly as before: it
+            # bounds what is *kept*, not the size of one file that has to be
+            # read to be compared (and the files it skips are reported).
+            baseline.command_lines[rel] = dict(enumerate(lines))
+            captured_chars += sum(len(line) for line in lines)
+            continue
+        # Past the general budget the scan keeps going: only the lines that
+        # build a clickable message are still captured, because those are the
+        # ones whose rendering the interaction audit has to compare.  The file
+        # is still read in full either way - a file with no click line at all
+        # must not be reported as unverified just because the reserve is full.
+        baseline.command_lines_truncated = True
+        kept: dict[int, str] | None = {}
+        kept_chars = 0
+        overflowed = False
+        for index, line in enumerate(lines):
+            if not mentions_click_event(line):
+                continue
+            if kept is None or interactive_chars + kept_chars + len(line) > COMMAND_INTERACTIVE_CAPTURE_CHARS:
+                # Does not fit the reserve: stop keeping this file's click lines
+                # (so nothing beyond the reserve accumulates) and report the file
+                # instead of pretending it was checked.  Stopping the check
+                # early would be worse: it would flag files nobody read.
+                overflowed = True
+                kept = None
+                continue
+            kept[index] = line
+            kept_chars += len(line)
+        if kept:
+            baseline.command_lines[rel] = kept
+            interactive_chars += kept_chars
+        elif overflowed:
+            _note_interaction_skip(baseline, rel)
+
+    writable_containers = _writable_container_keys(scan_result.text_units)
     for unit in scan_result.text_units:
         if _book_unit_kind(unit) != "nbt":
             continue
@@ -220,7 +303,14 @@ def take_baseline(root: Path, scan_result: ScanResult) -> AuditBaseline:
             parsed = json.loads(tag.value)
         except json.JSONDecodeError:
             continue
-        baseline.book_containers[(unit.file_path, unit.locator)] = _json_skeleton(parsed)
+        # Same comparison rule and same mask as ``_audit_book_containers``: the
+        # container's own text leaves are free, everything else (including the
+        # fields of a JSON-encoded component inside the container) must survive.
+        baseline.book_containers[(unit.file_path, unit.locator)] = book_container_skeleton(
+            parsed,
+            path,
+            writable_containers.get((unit.file_path, tuple(path)), frozenset()),
+        )
     return baseline
 
 
@@ -249,8 +339,15 @@ def audit_output(
     units: list[TextUnit] | None = None,
     registry: Any = None,
     cancel_event: Event | None = None,
+    official_terms_zh: dict[str, str] | None = None,
+    input_fingerprint: str = "",
 ) -> AuditResult:
-    """Re-scan the output copy and run every read-only pre-publication check."""
+    """Re-scan the output copy and run every read-only pre-publication check.
+
+    The rescan classifies units exactly like the run that produced them, so a
+    reviewed display-argument entry (keyed by the package fingerprint) applies
+    here too; without a fingerprint no entry applies, which is the safe default.
+    """
 
     from .pipeline import scan  # lazy: pipeline imports audit
     from .translator import TranslationPaused
@@ -260,7 +357,7 @@ def audit_output(
     baseline_scan = baseline_scan or ScanResult(root=root)
     units = units or []
     try:
-        rescan = scan(root, registry, cancel_event=cancel_event)
+        rescan = scan(root, registry, cancel_event=cancel_event, input_fingerprint=input_fingerprint)
     except TranslationPaused:
         # A cancel must surface as a pause, never as a structural audit error (A12).
         raise
@@ -277,18 +374,40 @@ def audit_output(
     _audit_nbt_structures(result, rescan, baseline.nbt_broken)
     _audit_mechanism_refs(result, baseline_scan.mechanism_refs, rescan.mechanism_refs)
     _audit_unparsed_commands(result, baseline_scan.file_filtered)
-    _audit_immutable_units(result, units)
+    _audit_immutable_units(result, units, official_terms_zh=official_terms_zh)
     resources = _collect_pack_resources(root)
     result.issues.extend(audit_resources(rescan.commands, resources))
     result.issues.extend(audit_books(units))
     result.issues.extend(_audit_book_containers(result, root, baseline, units))
     result.issues.extend(_audit_located_writeback(result, root, units))
+    result.issues.extend(_audit_fragment_merges(result, root, units))
     result.issues.extend(_audit_non_text_fields(result, root, baseline, units))
+    result.issues.extend(audit_mechanism_skeleton(root, baseline, units))
+    if baseline.command_lines_truncated:
+        result.issue(
+            "info",
+            "mechanism",
+            "",
+            "命令行基线采样达到上限：部分普通命令行未参与机制骨架对照（含点击事件的行仍按独立预算采集）",
+            limit=COMMAND_LINE_CAPTURE_CHARS,
+        )
+    if baseline.interaction_lines_skipped_count:
+        result.issue(
+            "error",
+            "interaction",
+            "",
+            f"含点击事件的命令行超过独立采样预算，无法证明这些行的交互排版未被改写"
+            f"（{baseline.interaction_lines_skipped_count} 个文件未采集）",
+            limit=COMMAND_INTERACTIVE_CAPTURE_CHARS,
+            files=baseline.interaction_lines_skipped,
+        )
     return result
 
 
 def _iter_files(root: Path) -> list[Path]:
-    return [path for path in root.rglob("*") if path.is_file()]
+    # OS metadata is not content: auditing it produced only false "unparseable"
+    # findings (see utils.is_os_metadata_path).
+    return [path for path in root.rglob("*") if path.is_file() and not is_os_metadata_path(path)]
 
 
 def _audit_json_structures(result: AuditResult, root: Path, baseline_parseable: set[str]) -> None:
@@ -298,7 +417,7 @@ def _audit_json_structures(result: AuditResult, root: Path, baseline_parseable: 
         rel = path.relative_to(root).as_posix()
         try:
             json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except UNREADABLE_TEXT_ERRORS as exc:
             if rel in baseline_parseable:
                 result.issue("error", "structure", rel, f"JSON 结构在写回后损坏：{exc}", exc=str(exc))
             else:
@@ -325,8 +444,20 @@ def _audit_unparsed_commands(result: AuditResult, file_filtered: dict[str, dict[
             result.issue("warning", "mechanism", rel, f"{count} 条命令的 SNBT 未能解析（已保留原文）", unparsed=count)
 
 
-def _audit_immutable_units(result: AuditResult, units: list[TextUnit]) -> None:
-    """Block publication if an identity / match / numeric / selector value changed."""
+def _audit_immutable_units(
+    result: AuditResult,
+    units: list[TextUnit],
+    *,
+    official_terms_zh: dict[str, str] | None = None,
+) -> None:
+    """Block publication if an identity / match / numeric / selector value changed.
+
+    ``official_terms_zh`` is the official Simplified-Chinese baseline. It settles
+    the numeric/enum case: when the official translation of a value equals what
+    we wrote, that is the game's own wording and must not block publication.
+    Reproduced from a real run — ``gui.none`` = "None" was written "无", exactly
+    the official text, and the nested archive was withheld over it.
+    """
 
     from .policy import POLICY_IMMUTABLE_ID, POLICY_IMMUTABLE_MATCH, POLICY_UNKNOWN
     from .utils import ENTITY_SELECTOR_RE
@@ -356,6 +487,10 @@ def _audit_immutable_units(result: AuditResult, units: list[TextUnit]) -> None:
             )
             continue
         if _looks_numeric_or_enum(unit.source_text) and unit.final_target != unit.source_text:
+            if official_terms_zh is not None and official_terms_zh.get(unit.locator) == unit.final_target:
+                # The game's own translation of this value is what we produced:
+                # a legitimate localization, not a rewritten mechanism value.
+                continue
             result.issue(
                 "error",
                 "numeric",
@@ -711,16 +846,6 @@ def audit_books(units: list[TextUnit]) -> list[AuditIssue]:
     return issues
 
 
-def _json_skeleton(value: Any) -> Any:
-    """Structural skeleton: keys/containers/event attributes, text values folded."""
-
-    if isinstance(value, dict):
-        return ("dict", sorted((key, _json_skeleton(child)) for key, child in value.items()))
-    if isinstance(value, list):
-        return ("list", [_json_skeleton(child) for child in value])
-    return ("leaf",)
-
-
 def _unit_nbt_path(unit: TextUnit) -> list[str | int] | None:
     try:
         locator = json.loads(unit.locator)
@@ -730,12 +855,60 @@ def _unit_nbt_path(unit: TextUnit) -> list[str | int] | None:
     return path if isinstance(path, list) else None
 
 
+def book_container_skeleton(value: Any, path: list[Any], writable: frozenset[str] | set[str] = frozenset()) -> Any:
+    """Skeleton of a JSON container stored as a string (book page / item data).
+
+    Defined once because the pre-write baseline and the post-write re-read are
+    compared with each other: two call sites that drifted apart would report a
+    legitimate translation as damage.  The container's own text leaves are free
+    (``fold_text``); a JSON-encoded component inside it keeps everything but its
+    declared inner leaves (``writable``).
+    """
+
+    if not isinstance(value, (dict, list)):
+        # A bare JSON string page: the stored string *is* the display text, so
+        # there is no structure here to preserve.
+        return ("leaf",)
+    return json_skeleton(value, writable=writable, pointer=_nbt_path_pointer(path), fold_text=True)
+
+
+def _writable_container_keys(units: list[TextUnit]) -> dict[tuple[str, tuple[Any, ...]], frozenset[str]]:
+    """Inner leaves declared writable inside each NBT JSON container.
+
+    A book page or item component stored as a JSON string declares its leaves as
+    ``path`` plus a nested ``json`` pointer.  The container skeleton masks those
+    inner leaves (and only them) when it compares the stored string before and
+    after the write.
+
+    The set depends on the *declaration*, never on whether a target arrived:
+    the pre-write baseline and the post-write read are compared with each other,
+    so both sides must derive the same mask from the same units.
+    """
+
+    allowed: dict[tuple[str, tuple[Any, ...]], set[str]] = {}
+    for unit in units:
+        if "!/" in unit.file_path:
+            continue
+        try:
+            locator = json.loads(unit.locator)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        path = locator.get("path")
+        pointer = locator.get("json")
+        if not isinstance(path, list) or not isinstance(pointer, str) or not pointer:
+            continue
+        base = _nbt_path_pointer(path)
+        allowed.setdefault((unit.file_path, tuple(path)), set()).add(composed_pointer(base, pointer))
+    return {key: frozenset(value) for key, value in allowed.items()}
+
+
 def _audit_book_containers(result: AuditResult, root: Path, baseline: AuditBaseline, units: list[TextUnit]) -> list[AuditIssue]:
     """Compare JSON container structure (extra/click/hover/style) before/after."""
 
     issues: list[AuditIssue] = []
     read_cache: dict[str, Any] = {}
     unit_by_locator = {(unit.file_path, unit.locator): unit for unit in units}
+    writable_by_container = _writable_container_keys(units)
     current_file = None
     for (rel, locator_json), expected in sorted(baseline.book_containers.items()):
         if rel != current_file:
@@ -751,7 +924,11 @@ def _audit_book_containers(result: AuditResult, root: Path, baseline: AuditBasel
         if tag.type_id != TAG_STRING:
             continue
         try:
-            actual = _json_skeleton(json.loads(tag.value))
+            actual = book_container_skeleton(
+                json.loads(tag.value),
+                path,
+                writable_by_container.get((rel, tuple(path)), frozenset()),
+            )
         except json.JSONDecodeError:
             result.issue("warning", "structure", rel, "书页 JSON 容器在写回后无法解析")
             continue
@@ -813,6 +990,120 @@ def _layout_empty_slot(unit: TextUnit) -> bool:
         and unit.metadata.get("layout_container") in {"sign", "text-display"}
         and "!/" not in unit.file_path
     )
+
+
+def _audit_fragment_merges(result: AuditResult, root: Path, units: list[TextUnit]) -> list[AuditIssue]:
+    """A dropped fragment is only legitimate when the passage carries the sentence.
+
+    Independent of the write door: it re-reads the declared passage, requires it
+    to exist in the same file, to be non-empty after the write, to differ from
+    its source (something was actually translated) and to no longer contain the
+    dropped fragment's English word as a standalone token.  A fragment that was
+    dropped while the sentence stayed English therefore blocks publication.
+
+    A passage member that the product merged away is looked up in the written
+    file by its original locator: it only counts as a legitimate merge when the
+    leaf still exists and was not emptied, so a deleted sibling still blocks.
+    """
+
+    import re as _re
+    from dataclasses import replace
+
+    from .extractors import LocatedTextReadError, read_located_text
+
+    issues: list[AuditIssue] = []
+    by_locator: dict[tuple[str, str], TextUnit] = {(unit.file_path, unit.locator): unit for unit in units}
+    read_cache: dict[str, Any] = {}
+    for unit in units:
+        declared = unit.metadata.get("fragment_merge")
+        if not isinstance(declared, dict) or "!/" in unit.file_path:
+            continue
+        target = unit.final_target
+        if target is None or target.strip():
+            # Nothing was dropped: the ordinary write-back check applies.
+            continue
+        passage = [str(part) for part in declared.get("passage") or [] if isinstance(part, str)]
+        members = [by_locator.get((unit.file_path, locator)) for locator in passage]
+        present = [member for member in members if member is not None]
+        missing = [locator for locator, member in zip(passage, members) if member is None]
+        # A declared member may legitimately stop being a unit when the product
+        # merges or reflows the sentence, but its leaf must still exist in the
+        # written file with its content intact — otherwise a deleted or emptied
+        # sibling would slip through as "merged". Anything unproven fails closed.
+        covered: list[str] = []
+        unproven: list[str] = []
+        for locator in missing:
+            # The scan may legitimately not hold this span (asset filtering, a
+            # merged neighbour, a name only present in the command), so the proof
+            # is read straight from the written file at the declared locator: the
+            # leaf must still exist and must not have been emptied.
+            probe = replace(unit)
+            probe.locator = locator
+            probe.source_text = ""
+            probe.metadata = {}
+            try:
+                written = read_located_text(root, probe, cache=read_cache)
+            except LocatedTextReadError as exc:
+                unproven.append(f"{locator}（{exc}）")
+                continue
+            if not written.strip():
+                unproven.append(f"{locator}（写回结果里是空的）")
+                continue
+            covered.append(written)
+        if not passage:
+            result.issue("error", "writeback", unit.file_path, "拆句碎片被丢弃，但整句声明为空", locator=unit.locator)
+            continue
+        if unproven:
+            result.issue(
+                "error",
+                "writeback",
+                unit.file_path,
+                "拆句碎片被丢弃，但整句成员无法证实在写回结果里仍然存在：" + "；".join(unproven[:3]),
+                locator=unit.locator,
+            )
+            continue
+        if missing:
+            result.issue(
+                "warning",
+                "writeback",
+                unit.file_path,
+                f"拆句碎片被丢弃，整句 {len(missing)} 处成员本次不是单元（写回结果仍在且未被清空）",
+                locator=unit.locator,
+            )
+        joined_target = "".join(covered) + "".join(
+            (member.final_target if member.final_target is not None else member.source_text) for member in present
+        )
+        others = [member for member in present if member is not unit]
+        fragment_word = unit.source_text.strip()
+        if not joined_target.strip():
+            result.issue("error", "writeback", unit.file_path, "拆句碎片被丢弃，但整句没有任何译文", locator=unit.locator)
+            continue
+        if others and not any((member.final_target or "") != member.source_text for member in others):
+            result.issue("error", "writeback", unit.file_path, "拆句碎片被丢弃，但整句其余段落仍是原文", locator=unit.locator)
+            continue
+        if fragment_word and _re.search(rf"(?<![A-Za-z]){_re.escape(fragment_word)}(?![A-Za-z])", joined_target):
+            result.issue(
+                "error",
+                "writeback",
+                unit.file_path,
+                f"拆句碎片被丢弃，但原文片段 {fragment_word!r} 仍留在整句里",
+                locator=unit.locator,
+            )
+            continue
+        source_newlines = unit.source_text.count("\n")
+        target_newlines = (unit.final_target or "").count("\n")
+        if source_newlines > target_newlines:
+            # The fragment's own line break is layout: dropping its words must not
+            # join the speaker line to the sentence. Neighbouring leaves reflow
+            # under the product's own sentence rules, which is their business.
+            result.issue(
+                "error",
+                "writeback",
+                unit.file_path,
+                f"拆句碎片被丢弃时丢了换行（自身 {source_newlines} -> {target_newlines}）",
+                locator=unit.locator,
+            )
+    return issues
 
 
 def _audit_located_writeback(result: AuditResult, root: Path, units: list[TextUnit]) -> list[AuditIssue]:
@@ -891,6 +1182,13 @@ def _writable_leaf_keys(units: list[TextUnit]) -> dict[str, set[str]]:
         if unit.final_target is None or "!/" in unit.file_path:
             continue
         if unit.format == "generic-json":
+            encoded = split_encoded_component_locator(unit.locator)
+            if encoded is not None:
+                # An encoded component's written leaf lives inside the string:
+                # composing the pointer here and in ``json_skeleton`` keeps the
+                # mask on the leaf instead of on the whole component.
+                allowed.setdefault(unit.file_path, set()).add(composed_pointer(encoded[0], encoded[1]))
+                continue
             allowed.setdefault(unit.file_path, set()).add(unit.locator)
         elif unit.format == "nbt-text":
             try:
@@ -903,7 +1201,7 @@ def _writable_leaf_keys(units: list[TextUnit]) -> dict[str, set[str]]:
             pointer = _nbt_path_pointer(path)
             json_pointer = locator.get("json")
             if isinstance(json_pointer, str) and json_pointer:
-                pointer = f"{pointer}{json_pointer}" if json_pointer.startswith("/") else f"{pointer}/{json_pointer}"
+                pointer = composed_pointer(pointer, json_pointer)
             allowed.setdefault(unit.file_path, set()).add(pointer)
     return allowed
 
@@ -913,13 +1211,15 @@ def _nbt_path_pointer(path: list[Any]) -> str:
 
 
 def _json_non_text_skeleton(value: Any, pointer: str, allowed: set[str]) -> Any:
-    if pointer in allowed:
-        return ("writable",)
-    if isinstance(value, dict):
-        return ("dict", sorted((key, _json_non_text_skeleton(child, f"{pointer}/{escape_pointer_part(str(key))}", allowed)) for key, child in value.items()))
-    if isinstance(value, list):
-        return ("list", [_json_non_text_skeleton(child, f"{pointer}/{index}", allowed) for index, child in enumerate(value)])
-    return ("leaf", value)
+    """JSON structure with declared writable leaves masked.
+
+    Real work lives in ``mechanism_skeleton.json_skeleton`` so that a
+    JSON-encoded component is compared by the same rule here, in the NBT
+    documents and on command lines.  ``fold_text`` stays off: in a JSON file an
+    undeclared field is compared by value, encoded component or not.
+    """
+
+    return json_skeleton(value, writable=allowed, pointer=pointer)
 
 
 def _nbt_non_text_skeleton(tag: NbtTag, pointer: str, allowed: set[str]) -> Any:
@@ -967,7 +1267,7 @@ def _audit_non_text_fields(result: AuditResult, root: Path, baseline: AuditBasel
         path = root / rel
         try:
             actual = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
+        except UNREADABLE_TEXT_ERRORS:
             continue
         if _json_non_text_skeleton(expected, "", allowed.get(rel, set())) != _json_non_text_skeleton(actual, "", allowed.get(rel, set())):
             issues.append(

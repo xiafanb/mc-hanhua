@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 from collections.abc import Callable
 from datetime import datetime
@@ -13,22 +14,59 @@ from uuid import uuid4
 
 from mc_hanhua.archives import ARCHIVE_SUFFIXES
 from mc_hanhua.gui_support import _models_endpoint, _protect_text, _unprotect_text
-from mc_hanhua.models import ArchiveResult, ProgressEvent, TranslationReport
+from mc_hanhua.models import (
+    ArchiveResult,
+    ProgressEvent,
+    TranslationReport,
+    summarize_failure_counts,
+)
 from mc_hanhua.quality import validate_contextual_target
 from mc_hanhua.task_records import atomic_write_json, input_fingerprint, load_manifest
+from mc_hanhua.utils import UNREADABLE_TEXT_ERRORS
 from mc_hanhua.webui.present import (
+    REPORT_RECORD_KIND,
     button_for_state,
+    chinese_reason,
+    completion_title,
+    estimate_cost,
+    format_amount,
+    format_duration_ms,
     issue_count,
+    metrics_texts,
+    model_price_for,
     npc_skip_keys,
     present_record,
     present_scan_result,
+    queue_start_state,
     stats_from_progress,
     stats_from_report,
+    unfinished_note,
+    unfinished_review_hint,
+    unfinished_units,
+    usage_line,
 )
 
 APP_TITLE = "Minecraft 汉化工具"
 DEFAULT_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
 MODEL_CACHE_TTL_SEC = 24 * 60 * 60
+QUEUE_LIMIT = 50
+RUNTIME_PROBLEM_LIMIT = 500
+RUNTIME_PROBLEM_SNAPSHOT_LIMIT = 200
+# Log lines a snapshot carries when the page has no cursor yet (first load or a
+# reconnect); with a cursor it only carries what is new.
+LOG_TAIL_MAX = 200
+# Failure reasons that mean "the service itself is broken", logged as errors
+# rather than warnings in the runtime problem feed.
+ERROR_LEVEL_REASONS = {
+    "missing_api_key",
+    "network_disconnected",
+    "network_error",
+    "timeout",
+    "rate_limited",
+    "server_error",
+    "http_error",
+    "unexpected_error",
+}
 KEY_ACTIONS = {"keep", "replace", "clear"}
 STAGE_TITLES = {
     "prepare": "准备输入",
@@ -118,6 +156,9 @@ class TaskController:
         self.translate_npc = True
         self.records: list[dict[str, Any]] = []
         self.logs: list[dict[str, str]] = []
+        # Monotonic count of log lines ever appended; the page sends back the
+        # last value it saw so a snapshot only carries the lines it is missing.
+        self.log_revision = 0
         self.manual_targets: dict[str, str] = {}
         self.last_report: TranslationReport | None = None
         self.resume_pending = False
@@ -137,11 +178,40 @@ class TaskController:
         self._apply_saved_key()
         self.busy = False
         self.current_request_id = ""
+        # Translation queue: in-memory FIFO consumed by the window between
+        # tasks; survives resets but not an app restart.
+        self.queue: list[dict[str, Any]] = []
+        self.auto_continue = bool(self.config.get("auto_continue", True))
+        # Per-task wall-clock and the last token usage seen in progress events.
+        # Events without usage (e.g. ai-result) must not reset the numbers to
+        # zero — the last known values stay until the task ends.
+        self.task_started_mono: float | None = None
+        self.task_elapsed_ms = 0
+        self.last_usage: dict[str, int] = {}
+        self.last_usage_requests = 0
+        # Batch totals across a queue session: every terminal task (complete,
+        # blocked, failed) consumed tokens, so all three accumulate.
+        self.session_totals: dict[str, float] = {"tasks": 0, "elapsed_ms": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
+        # Runtime problems surfaced live while a task runs; each carries a
+        # ``ref`` back to its log entry for the problem<->log jump.
+        self.runtime_problems: list[dict[str, Any]] = []
+        self._failure_seen: dict[str, int] = {}
+        self._last_error_text = ""
+        self._runtime_seq = 0
+
+    def _reset_runtime_tracking(self) -> None:
+        self.task_started_mono = None
+        self.task_elapsed_ms = 0
+        self.last_usage = {}
+        self.last_usage_requests = 0
+        self.runtime_problems = []
+        self._failure_seen = {}
+        self._last_error_text = ""
 
     def load_config(self) -> dict[str, Any]:
         try:
             data = json.loads(self.config_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except UNREADABLE_TEXT_ERRORS:
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -186,6 +256,7 @@ class TaskController:
         data: dict[str, Any] = {
             "base_url": self.base_url(),
             "model": self.model(),
+            "provider": self.provider(),
             "max_ai": self.config.get("max_ai", 0),
             "ai_workers": self.workers(),
             "quality_policy_version": 1,
@@ -193,6 +264,10 @@ class TaskController:
             "official_terms_dir": self.config.get("official_terms_dir", ""),
             "official_terms_version": self.config.get("official_terms_version", ""),
             "translate_npc": self.translate_npc,
+            "auto_continue": self.auto_continue,
+            "notify_system": self.notify_system_enabled(),
+            "notify_sound": self.notify_sound_enabled(),
+            "model_prices": self.config.get("model_prices", {}),
             "recent_tasks": self.config.get("recent_tasks", []),
         }
         stored = str(self.config.get("api_key_dpapi") or "")
@@ -208,6 +283,13 @@ class TaskController:
 
     def model(self) -> str:
         return str(self.config.get("model") or "mimo-v2.5")
+
+    def provider(self) -> str:
+        """Translation provider id; configs without the field keep chat mode."""
+
+        from mc_hanhua.translator import normalize_provider
+
+        return normalize_provider(self.config.get("provider"))
 
     def workers(self) -> int:
         try:
@@ -236,6 +318,7 @@ class TaskController:
         self.resume_pending = False
         self.percent = 0
         self.stats = {"scanned": 0, "groups": 0, "ai_passed": 0, "issues": 0}
+        self._reset_runtime_tracking()
         self.state = "ready"
         self.status_title = "等待开始"
         kind = "文件夹" if path.is_dir() else ("压缩包" if path.suffix.lower() in ARCHIVE_SUFFIXES else "文件")
@@ -444,6 +527,10 @@ class TaskController:
             self.config["base_url"] = str(payload.get("base_url") or DEFAULT_BASE_URL)
         if "model" in payload:
             self.config["model"] = str(payload.get("model") or "mimo-v2.5")
+        if "provider" in payload:
+            from mc_hanhua.translator import normalize_provider
+
+            self.config["provider"] = normalize_provider(payload.get("provider"))
         if "workers" in payload:
             try:
                 self.config["ai_workers"] = min(6, max(1, int(payload.get("workers") or 1)))
@@ -456,6 +543,32 @@ class TaskController:
                 self.config["max_ai"] = 0
         if "remember_api_key" in payload:
             self.config["remember_api_key"] = bool(payload.get("remember_api_key"))
+
+        if any(key in payload for key in ("price_input", "price_output", "price_currency")):
+            prices = dict(self.config.get("model_prices") or {})
+            if not isinstance(prices, dict):
+                prices = {}
+            model = str(self.config.get("model") or "mimo-v2.5")
+            entry = dict(prices.get(model) or {}) if isinstance(prices.get(model), dict) else {}
+            for source_key, target_key in (("price_input", "input_per_m"), ("price_output", "output_per_m")):
+                raw = payload.get(source_key)
+                if raw is None or str(raw).strip() == "":
+                    entry.pop(target_key, None)
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    return self._reject("模型单价必须是数字。")
+                if value < 0:
+                    return self._reject("模型单价不能为负数。")
+                entry[target_key] = value
+            currency = str(payload.get("price_currency") or entry.get("currency") or "CNY")
+            entry["currency"] = "USD" if currency.upper() == "USD" else "CNY"
+            if "input_per_m" in entry or "output_per_m" in entry:
+                prices[model] = entry
+            else:
+                prices.pop(model, None)
+            self.config["model_prices"] = prices
 
         candidate_key = previous_key
         candidate_unavailable = previous_unavailable
@@ -500,23 +613,277 @@ class TaskController:
         self._log("连接设置已保存。")
         return self.snapshot(ok=True, toast="已应用连接配置")
 
-    def reset_task(self) -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Translation queue
+    # ------------------------------------------------------------------
+
+    #: One rejection per unusable drop candidate, so a batch can report the mix
+    #: instead of one toast per file.
+    QUEUE_REJECTIONS = {
+        "duplicate": ("已在队列", "该资源已在队列中。"),
+        "missing": ("路径不存在", "加入队列的路径不存在。"),
+        "full": ("队列已满", f"队列已满（最多 {QUEUE_LIMIT} 个），请先处理或清空。"),
+    }
+
+    def _try_enqueue(self, path: Path) -> str:
+        """``added`` / ``missing`` / ``duplicate`` / ``full`` for one candidate."""
+
+        if not path.exists():
+            return "missing"
+        key = str(path.resolve())
+        if any(str(Path(str(item.get("input") or "")).resolve()) == key for item in self.queue):
+            return "duplicate"
+        if len(self.queue) >= QUEUE_LIMIT:
+            return "full"
+        output = unique_output_path(archive_output(path))
+        self.queue.append(
+            {
+                "id": uuid4().hex[:8],
+                "name": path.name,
+                "input": str(path),
+                "output": str(output),
+                "added_at": datetime.now().strftime("%H:%M:%S"),
+            }
+        )
+        self._log(f"已加入队列：{path.name}（等待 {len(self.queue)} 个）")
+        return "added"
+
+    def enqueue_task(self, path: Path) -> dict[str, Any]:
+        outcome = self._try_enqueue(path)
+        if outcome != "added":
+            return self._reject(self.QUEUE_REJECTIONS[outcome][1])
+        return self.snapshot(ok=True, toast=f"已加入队列：{path.name}")
+
+    def enqueue_paths(self, paths: list[Path]) -> dict[str, Any]:
+        """Queue a whole drop: one summary, with the reasons nothing else landed.
+
+        Silent rejection is what makes a batch drop feel broken — the user drops
+        five files, two are already queued and the queue is nearly full, and a
+        single "已加入队列 1 个" says nothing about the other four.
+        """
+
+        outcomes = [self._try_enqueue(Path(path)) for path in paths]
+        added = outcomes.count("added")
+        detail = "、".join(
+            f"{outcomes.count(outcome)} 个{label}"
+            for outcome, (label, _reason) in self.QUEUE_REJECTIONS.items()
+            if outcomes.count(outcome)
+        )
+        if not added:
+            return self._reject(f"没有加入任何任务：{detail}" if detail else "没有可加入的资源。")
+        if detail:
+            self._log(f"本次拖入 {len(paths)} 个：加入队列 {added} 个，{detail}")
+            return self.snapshot(ok=True, toast=f"已加入队列 {added} 个（{detail}）")
+        return self.snapshot(ok=True, toast=f"已加入队列 {added} 个")
+
+    def queue_remove(self, index: int) -> dict[str, Any]:
+        if not 0 <= index < len(self.queue):
+            return self._reject("队列条目不存在。")
+        removed = self.queue.pop(index)
+        return self.snapshot(ok=True, toast=f"已移除：{removed.get('name')}")
+
+    def queue_clear(self) -> dict[str, Any]:
+        count = len(self.queue)
+        self.queue = []
+        return self.snapshot(ok=True, toast=f"已清空 {count} 个排队任务" if count else "队列已是空的")
+
+    def queue_pop_head(self) -> dict[str, Any] | None:
+        return self.queue.pop(0) if self.queue else None
+
+    def claim_queue_head(self) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Pop the queue head into the input slot, or explain why it must not.
+
+        The explicit "start next" entry must never run ahead of an input the user
+        has not started yet: the window used to ``set_input`` the head
+        unconditionally, which replaced a pending pack (``set_input`` clears
+        ``manual_targets`` and the records) and never put it back in the queue —
+        a silent task loss for exactly the drop pattern this round introduced.
+        Advancing after a *completed* task still works, because a completed input
+        is not pending.
+
+        Returns ``(entry, snapshot)``; ``entry is None`` means nothing was taken
+        and the snapshot carries the reason.
+        """
+
         if self.busy:
-            return self._reject("任务进行中不能重置。")
-        self.task_id = uuid4().hex
-        self.input_path = None
-        self.output_path = None
-        self.records = []
-        self.logs = []
-        self.manual_targets = {}
-        self.last_report = None
-        self.resume_pending = False
-        self.state = "idle"
-        self.percent = 0
-        self.stats = {"scanned": 0, "groups": 0, "ai_passed": 0, "issues": 0}
-        self.status_title = "等待开始"
-        self.status_desc = "选择输入资源后即可开始"
+            return None, self.snapshot(ok=False, error="任务进行中，队列稍后再继续。")
+        if not self.queue:
+            return None, self.snapshot(ok=False, error="队列为空。")
+        if queue_start_state(
+            self.state, busy=False, has_input=self.input_path is not None, has_queue=True
+        ) == "disabled":
+            return None, self.snapshot(
+                ok=False,
+                error="当前输入还没开始处理，队列不会跳过它；先点「开始汉化」，或用「选择资源」换掉当前输入。",
+                toast="当前输入还没开始，队列不会跳过它",
+            )
+        entry = self.queue_pop_head()
+        if entry is None:
+            return None, self.snapshot(ok=False, error="队列为空。")
+        input_path = Path(str(entry.get("input") or ""))
+        output_path = Path(str(entry.get("output") or ""))
+        loaded = self.set_input(input_path)
+        if not loaded.get("ok"):
+            self.queue.insert(0, entry)
+            return None, loaded
+        if output_path.exists():
+            output_path = unique_output_path(output_path)
+        placed = self.set_output(output_path)
+        if not placed.get("ok"):
+            # 输入槽已经换成队首条目，输出没设成功：把它退回队首，别让它既不
+            # 在队列里也没被启动。
+            self.queue.insert(0, entry)
+            return None, placed
+        return entry, self.snapshot(ok=True)
+
+    def set_auto_continue(self, enabled: bool) -> dict[str, Any]:
+        previous = self.auto_continue
+        self.auto_continue = bool(enabled)
+        self.config["auto_continue"] = self.auto_continue
+        try:
+            self.save_config()
+        except Exception as exc:
+            self.auto_continue = previous
+            self.config["auto_continue"] = previous
+            return self._reject(f"偏好保存失败：{exc}")
         return self.snapshot(ok=True)
+
+    # ------------------------------------------------------------------
+    # Completion notifications
+    # ------------------------------------------------------------------
+
+    def notify_system_enabled(self) -> bool:
+        return bool(self.config.get("notify_system", True))
+
+    def notify_sound_enabled(self) -> bool:
+        return bool(self.config.get("notify_sound", False))
+
+    def set_notify(self, *, system: bool | None = None, sound: bool | None = None) -> dict[str, Any]:
+        previous = (self.notify_system_enabled(), self.notify_sound_enabled())
+        if system is not None:
+            self.config["notify_system"] = bool(system)
+        if sound is not None:
+            self.config["notify_sound"] = bool(sound)
+        try:
+            self.save_config()
+        except Exception as exc:
+            self.config["notify_system"], self.config["notify_sound"] = previous
+            return self._reject(f"偏好保存失败：{exc}")
+        return self.snapshot(ok=True)
+
+    def _terminal_notify(self, kind: str, detail: str, *, title: str = "") -> dict[str, str]:
+        """System-notification and banner payload for a terminal state.
+
+        ``title`` overrides the terminal label only where the state itself needs
+        a qualifier (a published run that still has texts left to translate);
+        notification permissions stay untouched either way.
+        """
+
+        titles = {
+            "complete": "汉化完成",
+            "blocked": "任务待处理",
+            "failed": "任务失败",
+            "paused": "任务已暂停",
+        }
+        parts = [detail] if detail else []
+        if self.task_elapsed_ms:
+            parts.append(f"耗时 {format_duration_ms(self.task_elapsed_ms)}")
+        usage_text = usage_line(self.last_usage or None, self.last_usage_requests)
+        if usage_text:
+            parts.append(usage_text)
+        price = model_price_for(self.config.get("model_prices"), self.model())
+        cost_text = format_amount(estimate_cost(self.last_usage or None, price), str((price or {}).get("currency") or "CNY"))
+        if cost_text:
+            parts.append(cost_text)
+        return {"kind": kind, "title": title or titles.get(kind, "任务状态更新"), "body": " · ".join(parts)}
+
+    # ------------------------------------------------------------------
+    # Elapsed time / token / cost metrics
+    # ------------------------------------------------------------------
+
+    def mark_task_started(self) -> None:
+        self.task_started_mono = time.monotonic()
+        self.task_elapsed_ms = 0
+
+    def _freeze_elapsed(self) -> int:
+        if self.task_started_mono is None:
+            return int(self.task_elapsed_ms or 0)
+        return int((time.monotonic() - self.task_started_mono) * 1000)
+
+    def _metrics_texts(self) -> dict[str, str]:
+        elapsed = self.task_elapsed_ms
+        if not elapsed and self.task_started_mono is not None and self.busy:
+            # A started task always shows a live value, even in its first
+            # millisecond, so the strip appears as soon as translation begins.
+            elapsed = max(1, self._freeze_elapsed())
+        price = model_price_for(self.config.get("model_prices"), self.model())
+        return metrics_texts(elapsed_ms=elapsed, usage=self.last_usage or None, reported_requests=self.last_usage_requests, price=price)
+
+    def _accumulate_session(self) -> None:
+        usage = self.last_usage or {}
+        price = model_price_for(self.config.get("model_prices"), self.model())
+        cost = estimate_cost(usage, price)
+        totals = self.session_totals
+        totals["tasks"] = int(totals.get("tasks", 0)) + 1
+        totals["elapsed_ms"] = int(totals.get("elapsed_ms", 0)) + int(self.task_elapsed_ms or 0)
+        totals["prompt_tokens"] = int(totals.get("prompt_tokens", 0)) + int(usage.get("prompt_tokens") or 0)
+        totals["completion_tokens"] = int(totals.get("completion_tokens", 0)) + int(usage.get("completion_tokens") or 0)
+        totals["cost"] = float(totals.get("cost", 0.0)) + (cost or 0.0)
+
+    # ------------------------------------------------------------------
+    # Runtime problem feed (problem <-> log sync)
+    # ------------------------------------------------------------------
+
+    def _add_runtime_problem(self, reason: str, event: ProgressEvent, *, source: str = "") -> str:
+        self._runtime_seq += 1
+        problem_id = f"rt-{self._runtime_seq}"
+        why = chinese_reason(reason)
+        origin = source or str(event.current_file or "") or str(event.message or "")
+        record = {
+            "id": problem_id,
+            "record_kind": "runtime",
+            "is_problem": True,
+            "issue": True,
+            "type": "runtime",
+            "policy": "UNKNOWN_REVIEW",
+            "role": "运行期问题",
+            "source": origin or why,
+            "target": "",
+            "why": why,
+            "why_code": reason,
+            "path": str(event.archive_id or "") or "运行中",
+            "full_path": str(event.current_file or ""),
+            "locator": "",
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "tag": "运行失败",
+            "editable": False,
+        }
+        self.runtime_problems.append(record)
+        if len(self.runtime_problems) > RUNTIME_PROBLEM_LIMIT:
+            self.runtime_problems = self.runtime_problems[-RUNTIME_PROBLEM_LIMIT:]
+        level = "error" if reason in ERROR_LEVEL_REASONS else "warning"
+        self._log(f"运行期问题：{why} · {origin}", level=level, ref=problem_id)
+        return problem_id
+
+    def _absorb_runtime_problems(self, event: ProgressEvent) -> None:
+        """Diff cumulative failure counters into per-item problem records.
+
+        ``failure_counts`` accumulates over the whole task, so the delta
+        against the previously seen value is exactly the number of new
+        failures since the last progress frame.
+        """
+
+        counts = event.failure_counts or {}
+        for reason in sorted(counts):
+            total = int(counts[reason] or 0)
+            delta = total - self._failure_seen.get(reason, 0)
+            self._failure_seen[reason] = total
+            for _ in range(min(delta, 10)):
+                self._add_runtime_problem(reason, event)
+        error_text = self._public_error(str(event.last_error or ""))
+        if error_text and error_text != self._last_error_text:
+            self._last_error_text = error_text
+            self._add_runtime_problem("unexpected_error", event, source=error_text)
 
     def on_scan_result(self, result: Any) -> dict[str, Any]:
         self.records = present_scan_result(result, translate_npc=self.translate_npc)
@@ -570,30 +937,53 @@ class TaskController:
         estimated = event.stage not in {"complete", "blocked", "failed"}
         self.percent = 99 if estimated and int(event.percent) >= 100 else max(0, min(100, int(event.percent)))
         self.status_title = STAGE_TITLES.get(event.stage, "正在处理")
-        extra = []
+        detail: list[str] = []
         if event.archives_discovered:
-            extra.append(f"数据包 {event.archive_index or 0} / {event.archives_discovered}")
+            detail.append(f"数据包 {event.archive_index or 0} / {event.archives_discovered}")
         if event.local_groups_total:
-            extra.append(f"当前包 {event.local_groups_completed} / {event.local_groups_total} 组")
+            detail.append(f"当前包 {event.local_groups_completed} / {event.local_groups_total} 组")
         if event.groups_discovered or event.groups_done:
-            extra.append(f"全任务已发现 {event.groups_discovered or event.groups_total} 组，已完成 {event.groups_done} 组")
+            detail.append(f"全任务已发现 {event.groups_discovered or event.groups_total} 组，已完成 {event.groups_done} 组")
         if event.in_flight or event.api_requests:
-            extra.append(f"请求进行中 {event.in_flight} · 已完成 {event.requests_completed or event.api_requests}")
+            detail.append(f"请求进行中 {event.in_flight} · 已完成 {event.requests_completed or event.api_requests}")
+        if event.responded_requests and event.avg_response_ms:
+            detail.append(
+                f"服务端响应 最近 {event.last_attempt_ms} ms · 平均 {event.avg_response_ms} ms"
+                f"（{event.responded_requests} 次成功响应，不含本地重试等待）"
+            )
         if event.token_usage:
             usage = event.token_usage
-            extra.append(
+            self.last_usage = dict(usage)
+            self.last_usage_requests = int(event.usage_reported_requests or 0)
+            reasoning = usage.get("reasoning_tokens")
+            # DeepSeek bills thinking tokens inside completion; showing only
+            # "输出" makes a small visible completion look like the whole cost.
+            reasoning_text = f" · 其中思考 {reasoning}" if isinstance(reasoning, int) else ""
+            detail.append(
                 f"Token 输入 {usage.get('prompt_tokens', '未知')} · 输出 {usage.get('completion_tokens', '未知')}"
+                f"{reasoning_text}"
                 f"（{event.usage_reported_requests} 次请求有用量回报）"
             )
+        if event.failure_counts:
+            detail.append(f"失败统计 {summarize_failure_counts(event.failure_counts)}")
+        if event.last_error:
+            detail.append(f"最近错误 {event.last_error}")
         if event.waiting_reason:
-            extra.append(event.waiting_reason)
+            detail.append(event.waiting_reason)
         if event.current_file:
-            extra.append(f"最近完成 {event.current_file}")
-        suffix = (" · " + " · ".join(extra)) if extra else ""
-        self.status_desc = f"{event.message}{suffix}"
-        self.stage_text = self.status_desc
+            detail.append(f"最近完成 {event.current_file}")
+        # 2026-09-19 反馈：运行状态行与处理日志逐条重复，状态区只保留阶段标题、
+        # 耗时/Token 指标行与进度条；停滞的服务（失败统计/最近错误）在日志行和
+        # 运行期问题列表（徽标 + 问题审阅）中仍然可见。
+        self.status_desc = ""
+        self.stage_text = self.status_title
+        # New failures and a changed last_error become per-item problem
+        # records (with linked log entries) while the task is still running,
+        # instead of appearing only after the report is loaded.
+        self._absorb_runtime_problems(event)
         self.stats = stats_from_progress(event, self.records)
-        self._log(f"[{self.percent}%] {self.status_desc}")
+        self.stats.update(self._metrics_texts())
+        self._log(f"[{self.percent}%] {event.message}{' · ' + ' · '.join(detail) if detail else ''}")
         return self.snapshot(ok=True, compact=True)
 
     def on_completed(self, report: TranslationReport) -> dict[str, Any]:
@@ -601,10 +991,15 @@ class TaskController:
         self.busy = False
         self.stop_requested = False
         self.resume_pending = False
+        self.task_elapsed_ms = self._freeze_elapsed()
+        if getattr(report, "token_usage", None):
+            self.last_usage = dict(report.token_usage)
+            self.last_usage_requests = int(getattr(report, "usage_reported_requests", 0) or 0)
         blocked = bool(report.audit_blocked or report.publication_status == "withheld")
         self.state = "blocked" if blocked else "complete"
         self.percent = 100 if not blocked else 99
         self.stats = stats_from_report(report, self.records)
+        self.stats.update(self._metrics_texts())
         if blocked:
             withheld = [item.archive_id for item in report.archive_results if item.publication_status == "withheld"]
             issue_count_value = sum(len(item.audit_issues) for item in report.archive_results)
@@ -612,16 +1007,26 @@ class TaskController:
             self.status_desc = f"译文已暂存；发布被阻止。未发布包 {len(withheld)}，问题 {issue_count_value}。"
             self._remember_task("blocked")
             self._log(self.status_desc, level="error")
+            notify = self._terminal_notify("blocked", f"发布被阻止，问题 {issue_count_value} 个")
         else:
-            self.status_title = "汉化完成" if report.scanned else "未找到可翻译文本"
-            self.status_desc = f"输出：{report.output_path}"
+            # 安全发布与任务状态仍是 complete：这些单元没有写回不代表整包失败，
+            # 但界面不能说无条件的「汉化完成」——RoH 交付包就是这样带着 817 条
+            # 仍是英文的可译文本被判为完成（2026-09-23 反馈）。
+            unfinished = unfinished_units(report)
+            hint = unfinished_review_hint(unfinished)
+            self.status_title = completion_title(report.scanned, unfinished)
+            self.status_desc = f"输出：{report.output_path}" + (f"。{hint}。" if hint else "")
             self._remember_task("completed")
-            self._log(f"完成：{report.output_path}")
-        return self.snapshot(ok=True)
+            self._log(f"完成：{report.output_path}" + (f" · {hint}" if hint else ""))
+            notify_detail = " · ".join(part for part in (f"输出 {report.output_path.name}", unfinished_note(unfinished)) if part)
+            notify = self._terminal_notify("complete", notify_detail, title=self.status_title if unfinished else "")
+        self._accumulate_session()
+        return self.snapshot(ok=True, notify=notify)
 
     def on_failed(self, message: str, log_path: str = "") -> dict[str, Any]:
         self.busy = False
         self.stop_requested = False
+        self.task_elapsed_ms = self._freeze_elapsed()
         blocked = "审计阻断" in message or "发布被阻止" in message
         self.state = "blocked" if blocked else "failed"
         self.status_title = "待处理" if blocked else "处理失败"
@@ -630,12 +1035,16 @@ class TaskController:
         self._log(f"错误：{message}", level="error")
         if log_path:
             self._log(f"诊断日志：{log_path}")
-        extra = {"error": message, "recovery": self.recovery_payload()}
+        kind = "blocked" if blocked else "failed"
+        notify = self._terminal_notify(kind, self.status_desc if blocked else message[:120])
+        self._accumulate_session()
+        extra = {"error": message, "recovery": self.recovery_payload(), "notify": notify}
         return self.snapshot(ok=False, **extra)
 
     def on_paused(self, message: str, log_path: str = "") -> dict[str, Any]:
         self.busy = False
         self.resume_pending = True
+        self.task_elapsed_ms = self._freeze_elapsed()
         self.state = "paused"
         self.status_title = "已停止" if self.stop_requested else "请求已暂停"
         self.status_desc = message
@@ -644,7 +1053,7 @@ class TaskController:
         self._log(message)
         if log_path:
             self._log(f"诊断日志：{log_path}")
-        return self.snapshot(ok=True)
+        return self.snapshot(ok=True, notify=self._terminal_notify("paused", message[:120]))
 
     def load_report_records(self, payload: dict[str, Any]) -> dict[str, Any]:
         units = payload.get("units") or []
@@ -654,9 +1063,43 @@ class TaskController:
         for item in units:
             record = dict(item)
             record["format_name"] = item.get("format", "")
+            # 报告单元来自已经结束的运行，只有它们能说明「这条可译文本最终有没有
+            # 落盘」；扫描预览的记录没有这个语义（final_target 为空只是因为还没
+            # 跑），来源必须显式标出，否则记录列表会把预览当成漏翻。
+            record["record_kind"] = REPORT_RECORD_KIND
             presented = present_record(record, translate_npc=self.translate_npc)
             seen.add(str(presented.get("id") or ""))
             records.append(presented)
+        filtered_details = report.get("filtered_details") or []
+        for detail in filtered_details:
+            records.append(
+                present_record(
+                    {
+                        "file_path": detail.get("file", ""),
+                        "locator": detail.get("locator", ""),
+                        "format": detail.get("format", ""),
+                        "source_text": detail.get("source", ""),
+                        "policy": detail.get("policy", "") or "UNKNOWN_REVIEW",
+                        "reason": detail.get("reason", ""),
+                        "record_kind": "filtered",
+                        "metadata": detail,
+                    },
+                    translate_npc=self.translate_npc,
+                )
+            )
+        detail_total = int(report.get("filtered_detail_total") or 0)
+        if detail_total > len(filtered_details):
+            records.append(
+                present_record(
+                    {
+                        "source_text": f"问题审阅显示 {len(filtered_details)} / 共 {detail_total} 条样本。",
+                        "policy": "INFO",
+                        "reason": "filtered_detail_limit",
+                        "record_kind": "info",
+                    },
+                    translate_npc=self.translate_npc,
+                )
+            )
         for warning in report.get("warnings", []):
             records.append(present_record({"source_text": str(warning), "policy": "UNKNOWN_REVIEW", "reason": "warning", "is_problem": True}, translate_npc=self.translate_npc))
         for raw_archive in report.get("archive_results") or []:
@@ -687,6 +1130,13 @@ class TaskController:
             self.status_title = "待处理"
             withheld = [item.get("archive_id") for item in report.get("archive_results") or [] if isinstance(item, dict) and item.get("publication_status") == "withheld"]
             self.status_desc = f"译文已暂存；发布被阻止。未发布包 {len(withheld)}。"
+        elif self.state == "complete":
+            # 报告与完成事件的到达顺序不固定（重新审计、历史报告重载）。完成态已经
+            # 成立时，重载的报告不能把「仍有 N 条未落盘」悄悄换回无条件的完成。
+            unfinished = unfinished_units(report)
+            hint = unfinished_review_hint(unfinished)
+            self.status_title = completion_title(int(report.get("scanned") or 0), unfinished)
+            self.status_desc = f"输出：{report.get('output_path')}" + (f"。{hint}。" if hint else "")
         # A02: a loaded report must restore the recovery payload, otherwise the
         # UI offers "重新审计并打包" while recovery_payload() still reports
         # nothing usable (and after a restart the workspace is simply lost).
@@ -715,6 +1165,10 @@ class TaskController:
                 workspace_path=workspace_path,
                 report_path=report_file,
                 recoverable=True,
+                # 恢复/重载的报告仍要回答「还有多少可译文本没落盘」，否则重启后
+                # 的质量摘要会把这件事说成零。
+                units_writeback_failed=int(report.get("units_writeback_failed") or 0),
+                unit_outcomes=dict(report.get("unit_outcomes") or {}),
             )
         return self.snapshot(ok=True)
 
@@ -748,12 +1202,31 @@ class TaskController:
         if self.last_report is None:
             return {"ready": False, "html": "<p>任务尚未完成。完成后可查看统计与保留原因。</p>"}
         report = self.last_report
+        # 耗时/Token/费用也进摘要：运行中的指标行只是单行概览（2026-09-21 用户
+        # 反馈它太占高度），完整数值在这里留档，任务结束后仍有据可查。
+        metrics = self._metrics_texts()
+        run_line = ""
+        if any(metrics.get(key) for key in ("elapsed_text", "usage_text", "cost_text")):
+            fields = []
+            if metrics.get("elapsed_text"):
+                fields.append(f"耗时 {metrics['elapsed_text']}")
+            if metrics.get("usage_text"):
+                # 后端原文是「输入 X，输出 Y」；指标行的标签是 Token，这里保持一致。
+                fields.append("Token " + str(metrics["usage_text"]))
+            if metrics.get("cost_text"):
+                fields.append(str(metrics["cost_text"]))
+            run_line = "<p>运行：{}。</p>".format(" · ".join(fields))
+        hint = unfinished_review_hint(unfinished_units(report))
+        unfinished_line = f"<p>{hint}。</p>" if hint else ""
         html = (
             f"<p>扫描 {report.scanned} · 已处理文本组 {report.groups_completed} · AI 通过 {report.units_translated}</p>"
+            f"{run_line}"
+            f"{unfinished_line}"
             f"<p>待处理问题 {self.stats.get('issues', 0)}。保存草稿不会改现有包；生成修订副本会重新审计并另存。</p>"
             f"<p>输出：{report.output_path}</p>"
         )
-        return {"ready": True, "html": html, "output": str(report.output_path)}
+        detail = str(metrics.get("usage_detail") or "")
+        return {"ready": True, "html": html, "output": str(report.output_path), "usage_detail": detail}
 
     def history_payload(self) -> list[dict[str, Any]]:
         items = []
@@ -778,7 +1251,18 @@ class TaskController:
         return options
 
     def snapshot(self, *, ok: bool = True, compact: bool = False, **extra: Any) -> dict[str, Any]:
-        buttons = button_for_state(self.state, has_input=self.input_path is not None, complete=self.state == "complete")
+        buttons = button_for_state(
+            self.state,
+            has_input=self.input_path is not None,
+            complete=self.state == "complete",
+            has_queue=bool(self.queue),
+        )
+        buttons["queue_start"] = queue_start_state(
+            self.state,
+            busy=self.busy,
+            has_input=self.input_path is not None,
+            has_queue=bool(self.queue),
+        )
         payload: dict[str, Any] = {
             "ok": ok,
             "task_id": self.task_id,
@@ -798,6 +1282,7 @@ class TaskController:
             "connection": {
                 "base_url": self.base_url(),
                 "model": self.model(),
+                "provider": self.provider(),
                 "workers": self.workers(),
                 "max_ai": self.config.get("max_ai", 0),
                 "remember_api_key": bool(self.config.get("remember_api_key")),
@@ -805,17 +1290,30 @@ class TaskController:
                 "key_state": self.key_state(),
                 "credential_version": self._credential_version,
                 "cached_models": self.cached_models(self.credential_endpoint(), self._credential_version) or [],
+                "price": model_price_for(self.config.get("model_prices"), self.model()),
             },
             "history": self.history_payload(),
             "summary": self.summary_payload(),
+            "queue": self.queue,
+            "auto_continue": self.auto_continue,
+            "prefs": {
+                "notify_system": self.notify_system_enabled(),
+                "notify_sound": self.notify_sound_enabled(),
+            },
+            "runtime_problems": self.runtime_problems[-RUNTIME_PROBLEM_SNAPSHOT_LIMIT:],
+            "session": dict(self.session_totals),
         }
         payload.update(extra)
         payload.pop("api_key", None)
         if not compact:
             payload["records"] = self.records
         # Progress snapshots omit expensive text records, but must deliver logs
-        # while the worker is running, not only on completion or pause.
-        payload["logs"] = self.logs[-200:]
+        # while the worker is running, not only on completion or pause. This is
+        # the *full* recent tail; the desktop layer replaces it with a delta
+        # against what the page already holds (see HtmlMainWindow._with_log_delta),
+        # because re-sending 200 lines per tick cost ~243 KB per snapshot.
+        payload["logs"] = self.logs[-LOG_TAIL_MAX:]
+        payload["log_revision"] = self.log_revision
         return payload
 
     def _remember_task(self, state: str) -> None:
@@ -831,10 +1329,19 @@ class TaskController:
         recent = [item for item in self.config.get("recent_tasks") or [] if isinstance(item, dict) and item.get("output") != entry["output"]]
         self.config["recent_tasks"] = [entry, *recent][:20]
 
-    def _log(self, text: str, level: str = "info") -> None:
+    def _log(self, text: str, level: str = "info", ref: str = "") -> None:
         text = self._public_error(text)
-        self.logs.append({"id": uuid4().hex[:8], "text": text, "level": level, "time": datetime.now().strftime("%H:%M:%S")})
+        entry = {"id": uuid4().hex[:8], "text": text, "level": level, "time": datetime.now().strftime("%H:%M:%S")}
+        if ref:
+            # ``ref`` links a log line to its runtime problem record so the
+            # frontend can jump between the two views.
+            entry["ref"] = ref
+        self.logs.append(entry)
         self.logs = self.logs[-2000:]
+        # Monotonic revision: the desktop layer compares it against the cursor it
+        # last delivered to decide which lines are still unseen (see
+        # HtmlMainWindow._with_log_delta).
+        self.log_revision += 1
 
     def _public_error(self, message: str) -> str:
         lowered = message.lower()

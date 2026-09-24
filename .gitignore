@@ -60,6 +60,7 @@ data/mod-assets/*
 /.agents/
 /.codex/
 /.local/
+/.zcode/
 
 # Credentials and private configuration (including encrypted key stores).
 .env

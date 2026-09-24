@@ -1,0 +1,50 @@
+/* 运行时层：设计稿没有、由真实任务驱动的元素与状态。
+   载入在 design-base.css / design-overlay.css / layout-fit.css 之后，因此这些
+   规则优先，设计稿本身保持逐字不变。 */
+
+/* 结果横幅：只用于非终态消息。终态（完成/失败/阻断/暂停）由状态行、处理日志、
+   问题审阅与 Windows 通知承担，页内不再重复（2026-09-21 反馈）。 */
+.banner {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 11px 14px; border: 1px solid var(--line); border-left: 3px solid var(--brand);
+  border-radius: var(--r-card); background: var(--panel-2);
+}
+/* display:flex 会盖过 UA 的 [hidden]，这条覆盖是必需的，不是冗余。 */
+.banner[hidden] { display: none; }
+.banner b { font-size: 13px; color: var(--brand-ink); }
+.banner p { font-size: 12.5px; color: var(--ink-3); line-height: 1.5; word-break: break-all; }
+.banner button { height: 28px; padding: 0 11px; font-size: 12px; margin-left: auto; flex: 0 0 auto; }
+.banner.failed { background: var(--danger-soft); border-left-color: var(--danger); }
+.banner.failed b { color: var(--danger); }
+.banner.blocked { background: var(--warn-soft); border-left-color: var(--warn); }
+.banner.blocked b { color: var(--warn); }
+.banner.paused b { color: var(--info); }
+
+/* 设计稿对 .records-head 定了 display:grid，胜过 UA 的 [hidden]；
+   切到扫描预览/问题审阅时表头必须消失，故这条覆盖同样是必需的。 */
+.records-head[hidden] { display: none; }
+.records-foot .check[hidden] { display: none; }
+.queue-head .count[hidden] { display: none; }
+
+/* 「已入队」拖放态：设计稿画了悬停与拖入，这一态是壳层补的。
+   提示行的 [hidden] 覆盖同样必要：`.drop.over .drop-tip` 的 display:block
+   特异性高于 UA 的 [hidden] 规则。 */
+.drop.queued { border-color: var(--brand); background: var(--brand-soft); }
+.drop.queued .drop-tip { display: block; }
+.drop-tip[hidden] { display: none; }
+
+/* 运行期问题卡片与日志跳转按钮：真实运行时才有。 */
+.rec.runtime { border-left: 2px solid var(--danger-line); }
+.jump {
+  border: 1px solid var(--line); background: #fff; color: var(--brand-ink);
+  border-radius: var(--r-tag); padding: 1px 8px; font-size: 11.5px; white-space: nowrap;
+}
+#badge.pulse { animation: badge-pulse .45s ease-in-out 2; }
+@keyframes badge-pulse { 50% { transform: scale(1.45); } }
+
+/* 队首就是「自动继续」会启动的那一个：标出来，队列从哪儿开始才不用猜。
+   它是 li 的弹性行成员，不是 .q-name 的内容——.q-name 有 ellipsis，会把标记裁掉。 */
+.queue-list .q-next {
+  flex: 0 0 auto; padding: 1px 7px; border-radius: var(--r-tag); white-space: nowrap;
+  background: var(--brand-soft); color: var(--brand-ink); font-size: 11px;
+}
