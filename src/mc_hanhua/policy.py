@@ -12,6 +12,7 @@ decides what becomes a TextUnit. Policy never globally unlocks strings.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .models import TextUnit
@@ -33,6 +34,22 @@ POLICY_IMMUTABLE_ID = "IMMUTABLE_ID"
 POLICY_IMMUTABLE_MATCH = "IMMUTABLE_MATCH_VALUE"
 POLICY_TRANSLATABLE = "TRANSLATABLE_DISPLAY"
 POLICY_UNKNOWN = "UNKNOWN_REVIEW"
+
+_PURE_NUMERIC_LITERAL_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?")
+_PURE_ENUM_LITERALS = frozenset({"true", "false", "null", "none"})
+
+
+def is_pure_numeric_or_enum_literal(value: str) -> bool:
+    """Whether a complete string is a numeric, boolean, or null-like literal.
+
+    This lexical rule is shared with the independent publication audit. It is
+    deliberately exact: prose containing digits or an enum-like word is not
+    locked. Language-file values are handled separately by ``classify_unit``
+    because a word such as ``None`` can be legitimate player-facing text there.
+    """
+
+    stripped = str(value).strip().lower()
+    return stripped in _PURE_ENUM_LITERALS or bool(_PURE_NUMERIC_LITERAL_RE.fullmatch(stripped))
 
 # Resource / identity keys that participate in commands, selectors, recipes,
 # predicates, functions, storage, dimensions, scoreboards, teams and bossbars.
@@ -400,6 +417,22 @@ def classify_unit(unit: TextUnit) -> tuple[str, str]:
 
     existing = getattr(unit, "policy", "") or (unit.metadata or {}).get("policy")
     existing_reason = getattr(unit, "policy_reason", "") or (unit.metadata or {}).get("policy_reason") or "preset"
+    if unit.format in {"json-lang", "legacy-lang"}:
+        # Language files contain player-facing values by definition. In
+        # particular, a value such as "None" may have an official Chinese
+        # translation, so the literal guard below must not lock it.
+        if existing in {POLICY_IMMUTABLE_ID, POLICY_IMMUTABLE_MATCH, POLICY_TRANSLATABLE, POLICY_UNKNOWN}:
+            return str(existing), str(existing_reason)
+        return POLICY_TRANSLATABLE, "language-file value"
+
+    # Pure values have no prose to translate. Keep explicit identity/match
+    # locks as-is, but override a provisional display/unknown classification
+    # before the unit can be sent to a provider.
+    if existing in {POLICY_IMMUTABLE_ID, POLICY_IMMUTABLE_MATCH}:
+        return str(existing), str(existing_reason)
+    if is_pure_numeric_or_enum_literal(unit.source_text):
+        return POLICY_IMMUTABLE_MATCH, "pure numeric/boolean/enum literal"
+
     # Embedded command payloads must be classified by SNBT/JSON role even when
     # a prior pass stamped IMMUTABLE because the outer NBT leaf is Command.
     try:
@@ -438,8 +471,6 @@ def classify_unit(unit: TextUnit) -> tuple[str, str]:
             # SNBT extraction already restricted to SNBT_TEXT_KEYS.
             return POLICY_TRANSLATABLE, "audited command SNBT display value"
         return POLICY_TRANSLATABLE, "command display text"
-    if unit.format in {"json-lang", "legacy-lang"}:
-        return POLICY_TRANSLATABLE, "language-file value"
     if unit.format == "generic-json":
         encoded = split_encoded_component_locator(unit.locator)
         if encoded is not None:

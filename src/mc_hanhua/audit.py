@@ -30,7 +30,12 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
-from .mechanism_skeleton import audit_mechanism_skeleton, json_skeleton, mentions_click_event
+from .mechanism_skeleton import (
+    audit_mechanism_skeleton,
+    embedded_display_command_preserves_mechanisms,
+    json_skeleton,
+    mentions_click_event,
+)
 from .models import ScanResult, TextUnit
 from .nbt import (
     TAG_BYTE,
@@ -50,6 +55,7 @@ from .nbt import (
     read_nbt_file,
     read_region_chunks,
 )
+from .policy import is_pure_numeric_or_enum_literal
 from .quality import clue_token_drift, container_display_risk
 from .text_components import composed_pointer, escape_pointer_part, split_encoded_component_locator
 from .utils import UNREADABLE_TEXT_ERRORS, is_os_metadata_path, read_text
@@ -486,7 +492,7 @@ def _audit_immutable_units(
                 locator=unit.locator,
             )
             continue
-        if _looks_numeric_or_enum(unit.source_text) and unit.final_target != unit.source_text:
+        if is_pure_numeric_or_enum_literal(unit.source_text) and unit.final_target != unit.source_text:
             if official_terms_zh is not None and official_terms_zh.get(unit.locator) == unit.final_target:
                 # The game's own translation of this value is what we produced:
                 # a legitimate localization, not a rewritten mechanism value.
@@ -498,15 +504,6 @@ def _audit_immutable_units(
                 f"数值/布尔/枚举被改写：{unit.source_text!r} -> {unit.final_target!r}",
                 locator=unit.locator,
             )
-
-
-def _looks_numeric_or_enum(value: str) -> bool:
-    stripped = value.strip().lower()
-    if stripped in {"true", "false", "null", "none"}:
-        return True
-    if re.fullmatch(r"-?\d+(\.\d+)?[bslfd]?", stripped):
-        return True
-    return False
 
 
 def _audit_mechanism_refs(result: AuditResult, baseline_refs: set[str], output_refs: set[str]) -> None:
@@ -872,6 +869,31 @@ def book_container_skeleton(value: Any, path: list[Any], writable: frozenset[str
     return json_skeleton(value, writable=writable, pointer=_nbt_path_pointer(path), fold_text=True)
 
 
+def _embedded_book_command_values(value: Any, pointer: str) -> dict[str, str]:
+    """Find explicit command-valued click events in a serialized book page."""
+
+    found: dict[str, str] = {}
+    if isinstance(value, dict):
+        for event_key in ("clickEvent", "click_event"):
+            event = value.get(event_key)
+            if not isinstance(event, dict):
+                continue
+            action = str(event.get("action") or "").lower()
+            command = event.get("value")
+            if action in {"run_command", "run_command_if_loaded", "suggest_command"} and isinstance(command, str):
+                event_pointer = f"{pointer}/{escape_pointer_part(event_key)}/value"
+                # The command is eligible for masking only when the independent
+                # mechanism parser can prove it is a JSON display command.
+                if embedded_display_command_preserves_mechanisms(command, command):
+                    found[event_pointer] = command
+        for key, child in value.items():
+            found.update(_embedded_book_command_values(child, f"{pointer}/{escape_pointer_part(str(key))}"))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.update(_embedded_book_command_values(child, f"{pointer}/{index}"))
+    return found
+
+
 def _writable_container_keys(units: list[TextUnit]) -> dict[tuple[str, tuple[Any, ...]], frozenset[str]]:
     """Inner leaves declared writable inside each NBT JSON container.
 
@@ -923,15 +945,45 @@ def _audit_book_containers(result: AuditResult, root: Path, baseline: AuditBasel
             continue
         if tag.type_id != TAG_STRING:
             continue
+        source_tag = _baseline_nbt_tag(baseline, unit, path)
+        if source_tag is None or source_tag.type_id != TAG_STRING:
+            continue
         try:
-            actual = book_container_skeleton(
-                json.loads(tag.value),
-                path,
-                writable_by_container.get((rel, tuple(path)), frozenset()),
-            )
+            source_value = json.loads(source_tag.value)
+            output_value = json.loads(tag.value)
         except json.JSONDecodeError:
             result.issue("warning", "structure", rel, "书页 JSON 容器在写回后无法解析")
             continue
+        container_key = (rel, tuple(path))
+        writable = set(writable_by_container.get(container_key, frozenset()))
+        source_commands = _embedded_book_command_values(source_value, _nbt_path_pointer(path))
+        output_commands = _embedded_book_command_values(output_value, _nbt_path_pointer(path))
+        safe_command_paths: set[str] = set()
+        for command_path, source_command in source_commands.items():
+            output_command = output_commands.get(command_path)
+            if output_command is not None and embedded_display_command_preserves_mechanisms(source_command, output_command):
+                safe_command_paths.add(command_path)
+                continue
+            result.issue(
+                "error",
+                "mechanism",
+                rel,
+                "书页点击事件中的嵌入命令无法证明机制结构未变",
+                locator=locator_json,
+                pointer=command_path,
+            )
+        for command_path in output_commands.keys() - source_commands.keys():
+            result.issue(
+                "error",
+                "mechanism",
+                rel,
+                "书页写回新增了点击事件中的嵌入命令",
+                locator=locator_json,
+                pointer=command_path,
+            )
+        writable.update(safe_command_paths)
+        expected = book_container_skeleton(source_value, path, writable)
+        actual = book_container_skeleton(output_value, path, writable)
         if actual != expected:
             result.issue(
                 "error",

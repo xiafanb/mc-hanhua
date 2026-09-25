@@ -22,6 +22,7 @@ from .quality import (
     newline_rule,
     passage_runs,
     repair_layout_candidate,
+    restore_prose_line_shape,
     validate_contextual_target,
 )
 from .utils import (
@@ -1880,8 +1881,28 @@ class QwenMTTranslator(OpenAICompatibleTransport):
         if reply is None:
             return None
         content, terms = reply
+        # A sign group can span two adjacent blocks, and the joined MT call may
+        # return fewer rows than the group has slots. Rebuild that shorter reply
+        # onto the source's row shape before the shared candidate gate; if the
+        # helper cannot prove a safe split, the ordinary per-slot fallback runs.
+        candidate = normalize_layout_newlines(joined, content)
+        returned_lines = [line for line in candidate.split("\n") if line.strip()]
+        if 1 <= len(returned_lines) < len(slots):
+            shaped = restore_prose_line_shape(
+                joined,
+                candidate,
+                min_line_chars=2,
+                # Sign rows have a shared physical width. Weighting each row
+                # by the length of its English wording can collapse a short
+                # source row into a one-character Chinese fragment.
+                uniform_line_width=group.container_type == "sign",
+            )
+            if shaped is None:
+                self._record_failure("newline_structure", f"{self._group_diagnostic(group)}; 合并译文无法安全恢复告示牌行数")
+                return None
+            candidate = shaped
         probe = self._layout_probe(group, joined)
-        target, reason = self._finish_candidate(probe, content, layout_reflow=True)
+        target, reason = self._finish_candidate(probe, candidate, layout_reflow=True)
         if target is None:
             self._record_failure(reason or "low_quality", f"{self._group_diagnostic(group)}; 合并译文未过校验")
             return None

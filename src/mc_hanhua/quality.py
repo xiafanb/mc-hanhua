@@ -25,7 +25,7 @@ from .utils import PLACEHOLDER_RE, normalize_layout_newlines, placeholder_tokens
 #: instead of answering a rule set they were never judged by.
 QUALITY_CACHE_VERSION = "context-v8"
 BOOK_CACHE_VERSION = "book-context-v3"
-LAYOUT_CACHE_VERSION = "layout-v2"
+LAYOUT_CACHE_VERSION = "layout-v3"
 #: Name of the input-version-scoped translation memory. The rule generation is
 #: part of the file name (as it is part of every context key) because rows
 #: written under an older grammar are unreachable and must not look like a
@@ -698,6 +698,7 @@ _NO_LINE_START = "。，、；：！？…·～）〕］｝〉》」』】”’
 _NO_LINE_END = "（〔［｛〈《「『【“‘([{\\"
 #: A list row — the source's breaks separate rows, so they are never re-wrapped.
 _ROW_START_RE = re.compile(r"^\s*(?:[-*•·▪◦>►▶]|\(?\d{1,2}[.)、])")
+_BULLET_ROW_RE = re.compile(r"^([ \t]*•[ \t]+)(\S.*)$")
 #: A final line made of spaces/tabs only — the map's way of pushing the next
 #: component (usually the clickable control row) to the right of its own line.
 _TRAILING_FILL_RE = re.compile(r"\n[ \t]+$")
@@ -827,23 +828,45 @@ def _width_index(text: str, width: float) -> int:
     return len(text) - 1
 
 
-def _pick_break(text: str, ideal: int, lower: int, spans: list[tuple[int, int]]) -> int | None:
+def _pick_break(
+    text: str,
+    ideal: int,
+    lower: int,
+    spans: list[tuple[int, int]],
+    *,
+    upper: int | None = None,
+    prefer_nearest: bool = False,
+) -> int | None:
     """Nearest natural, safe break to ``ideal``, never at or before ``lower``."""
 
     window = max(6, len(text) // 4)
     best: tuple[tuple[int, int, int, int], int] | None = None
-    for position in range(lower, len(text)):
+    last = min(len(text) - 1, upper if upper is not None else len(text) - 1)
+    for position in range(lower, last + 1):
         rank = _break_rank(text, position, spans)
         if rank is None:
             continue
         distance = abs(position - ideal)
-        key = (0 if distance <= window else 1, rank, distance, position)
+        # Keep the long-standing prose preference for a stronger natural
+        # boundary. Equal-width sign reflow opts into nearest-first so the
+        # display can fill physical rows without collapsing short slots.
+        key = (
+            (0 if distance <= window else 1, distance, rank, position)
+            if prefer_nearest
+            else (0 if distance <= window else 1, rank, distance, position)
+        )
         if best is None or key < best[0]:
             best = (key, position)
     return best[1] if best is not None else None
 
 
-def _wrap_prose(texts: list[str], slots: list[str]) -> list[str] | None:
+def _wrap_prose(
+    texts: list[str],
+    slots: list[str],
+    *,
+    min_line_chars: int = 1,
+    uniform_line_width: bool = False,
+) -> list[str] | None:
     """Rebuild a paragraph's lines across the source's own line shape.
 
     The candidate's lines are joined and re-split in proportion to the source
@@ -852,33 +875,88 @@ def _wrap_prose(texts: list[str], slots: list[str]) -> list[str] | None:
     be reached without breaking a token or an ASCII word.
     """
 
-    if len(texts) == len(slots):
+    minimum = max(1, int(min_line_chars))
+    if len(texts) == len(slots) and all(len(line.strip()) >= minimum for line in texts):
         # The candidate already has one line per source line: its own breaks are
         # the author's, and re-wrapping them would only move text around.
         return list(texts)
     stream = _join_lines(texts)
-    if len(stream) < len(slots):
+    if len(stream) < minimum * len(slots):
         return None
     spans = _token_spans(stream)
-    weights = [max(1, _display_width(slot.strip())) for slot in slots]
+    weights = [1 for _slot in slots] if uniform_line_width else [max(1, _display_width(slot.strip())) for slot in slots]
     total = sum(weights)
     width = _display_width(stream)
     cuts: list[int] = []
-    lower = 1
+    lower = minimum
     consumed = 0
-    for weight in weights[:-1]:
+    for slot_index, weight in enumerate(weights[:-1]):
         consumed += weight
-        position = _pick_break(stream, _width_index(stream, consumed / total * width), lower, spans)
+        remaining_slots = len(slots) - slot_index - 1
+        upper = len(stream) - minimum * remaining_slots
+        position = _pick_break(
+            stream,
+            _width_index(stream, consumed / total * width),
+            lower,
+            spans,
+            upper=upper,
+            prefer_nearest=uniform_line_width,
+        )
         if position is None:
             return None
         cuts.append(position)
-        lower = position + 1
+        lower = position + minimum
     lines: list[str] = []
     start = 0
     for position in [*cuts, len(stream)]:
         lines.append(stream[start:position])
         start = position
     return lines
+
+
+def _bullet_rows(text: str) -> tuple[list[str], list[list[tuple[str, str]]]] | None:
+    """Read a bullet list without treating its row breaks as prose wrapping."""
+
+    leading: list[str] = []
+    rows: list[list[tuple[str, str]]] = []
+    for line in text.split("\n"):
+        if not line and not rows:
+            leading.append(line)
+            continue
+        match = _BULLET_ROW_RE.fullmatch(line)
+        if match:
+            rows.append([(match.group(1), match.group(2))])
+            continue
+        if not rows or not line.strip() or not line.startswith((" ", "\t")):
+            return None
+        indent = line[: len(line) - len(line.lstrip(" \t"))]
+        rows[-1].append((indent, line[len(indent) :]))
+    return (leading, rows) if rows else None
+
+
+def restore_bullet_list_shape(source: str, target: str) -> str | None:
+    """Restore list row positions and indentation when an MT reply trims them.
+
+    Each source bullet must have exactly one candidate bullet in the same order.
+    A wrapped bullet may be reflowed within its own row, but text never crosses
+    a bullet boundary. Unclear row ownership remains a validation failure.
+    """
+
+    source_rows = _bullet_rows(source)
+    target_rows = _bullet_rows(target)
+    if source_rows is None or target_rows is None:
+        return None
+    leading, source_groups = source_rows
+    _target_leading, target_groups = target_rows
+    if len(source_groups) != len(target_groups):
+        return None
+    restored = list(leading)
+    for source_group, target_group in zip(source_groups, target_groups):
+        wrapped = _wrap_prose([text for _prefix, text in target_group], [text for _prefix, text in source_group])
+        if wrapped is None or len(wrapped) != len(source_group) or any(not line.strip() for line in wrapped):
+            return None
+        restored.extend(prefix + line.strip() for (prefix, _source), line in zip(source_group, wrapped))
+    return "\n".join(restored)
 
 
 def _run_stop(
@@ -1187,7 +1265,13 @@ def _shape_lines_intact(source_lines: list[str], target_lines: list[str]) -> boo
     return True
 
 
-def restore_prose_line_shape(source: str, target: str) -> str | None:
+def restore_prose_line_shape(
+    source: str,
+    target: str,
+    *,
+    min_line_chars: int = 1,
+    uniform_line_width: bool = False,
+) -> str | None:
     """Re-wrap a reflowing candidate across the source's own line shape.
 
     Map dialogue is prose the author wrapped by hand: the breaks are where the
@@ -1225,6 +1309,10 @@ def restore_prose_line_shape(source: str, target: str) -> str | None:
         target.count("\n") == source.count("\n")
         and _blank_line_indices(target) == _blank_line_indices(source)
         and _shape_lines_intact(source_lines, target_lines)
+        and all(
+            _line_kind(source_line) != "prose" or len(target_line.strip()) >= max(1, int(min_line_chars))
+            for source_line, target_line in zip(source_lines, target_lines)
+        )
     ):
         return target
     prose = [line for line in source_lines if _line_kind(line) == "prose"]
@@ -1240,7 +1328,12 @@ def restore_prose_line_shape(source: str, target: str) -> str | None:
         if kind != "prose":
             lines.append(anchored.get(index, texts[0]))
             continue
-        wrapped = _wrap_prose(chunks[index], list(texts))
+        wrapped = _wrap_prose(
+            chunks[index],
+            list(texts),
+            min_line_chars=min_line_chars,
+            uniform_line_width=uniform_line_width,
+        )
         if wrapped is None:
             return None
         lines.extend(wrapped)
@@ -1320,7 +1413,7 @@ def repair_layout_candidate(
     rule = rule if rule is not None else newline_rule(unit)
     if not rule.reflow or not target.strip():
         return target
-    repaired = restore_prose_line_shape(source, target)
+    repaired = restore_bullet_list_shape(source, target) if _bullet_rows(source) is not None else restore_prose_line_shape(source, target)
     if repaired is None:
         return None
     # The re-wrap may move the edges with the text it re-splits; put them back.

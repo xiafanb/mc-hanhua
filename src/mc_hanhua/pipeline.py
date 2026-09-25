@@ -49,6 +49,7 @@ from .utils import UNREADABLE_TEXT_ERRORS, is_os_metadata_path, looks_like_chine
 
 ProgressCallback = Callable[[ProgressEvent], None]
 SeedTranslations = dict[tuple[str, str, str, str], str]
+ReviewedKeepKeys = dict[str, str]
 
 
 def _merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
@@ -1185,6 +1186,85 @@ def load_prior_translation_seeds(
     return seeds
 
 
+def load_prior_reviewed_keep_keys(
+    report_dir: Path,
+    input_path: Path,
+    *,
+    fallback_dirs: tuple[Path, ...] = (),
+) -> ReviewedKeepKeys:
+    """Load only explicitly reviewed keep decisions for this exact input.
+
+    Unlike translation drafts, keep decisions are inherited from the latest
+    matching report as a whole. An empty newer report must revoke an older
+    review, rather than silently reviving decisions a person may have removed.
+    The report must identify both the exact input path and its content
+    fingerprint. Model keeps and failures are deliberately not reusable.
+    """
+
+    expected = task_input_fingerprint(input_path) if input_path.exists() else ""
+    if not expected:
+        return {}
+
+    candidates: list[tuple[int, str, dict[str, object]]] = []
+    seen_dirs: set[Path] = set()
+    for directory in (report_dir, *fallback_dirs):
+        directory = directory.resolve()
+        if directory in seen_dirs:
+            continue
+        seen_dirs.add(directory)
+        for report_path in directory.glob("*-translation-report.json"):
+            try:
+                payload = json.loads(report_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                report = payload.get("report", {})
+                if not isinstance(report, dict):
+                    continue
+                report_input = str(report.get("input_path") or "")
+                if not report_input or Path(report_input).resolve() != input_path.resolve():
+                    continue
+                if str(report.get("input_fingerprint") or "") != expected:
+                    continue
+                stat = report_path.stat()
+                candidates.append((stat.st_mtime_ns, str(report_path.resolve()), payload))
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+                continue
+    if not candidates:
+        return {}
+
+    _mtime_ns, _path, payload = max(candidates, key=lambda item: (item[0], item[1]))
+    units = payload.get("units", [])
+    if not isinstance(units, list):
+        return {}
+
+    from .task_records import unit_key
+
+    reviewed: ReviewedKeepKeys = {}
+    for item in units:
+        if not isinstance(item, dict):
+            continue
+        reason = item.get("intentional_keep")
+        file_path = item.get("file_path")
+        format_name = item.get("format")
+        locator = item.get("locator")
+        source_text = item.get("source_text")
+        if not isinstance(reason, str) or not reason.startswith("reviewed_"):
+            continue
+        if not all(isinstance(value, str) for value in (file_path, format_name, locator, source_text)):
+            continue
+
+        normalized_path = file_path.replace("\\", "/")
+        archive_chain = item.get("archive_chain")
+        if isinstance(archive_chain, list):
+            chain = [str(part).replace("\\", "/").rstrip("/") for part in archive_chain if str(part)]
+            if chain:
+                prefix = "!/".join(chain) + "!/"
+                if not normalized_path.startswith(prefix):
+                    normalized_path = prefix + normalized_path.lstrip("/")
+        reviewed[unit_key([], normalized_path, format_name, locator, source_text)] = reason
+    return reviewed
+
+
 def _resolve_mod_assets(mod_assets: ModAssetLibrary | Path | None) -> ModAssetLibrary | None:
     if isinstance(mod_assets, ModAssetLibrary):
         library = mod_assets
@@ -1362,12 +1442,22 @@ def _apply_seed_targets(units: list[TextUnit], seeds: SeedTranslations) -> None:
             unit.final_target = _validated_candidate(unit, target, origin="seed")
 
 
-def _apply_desktop_choices(units, skip_keys, manual_targets, *, prefix="", official_terms=None, translate_npc: bool = True):
+def _apply_desktop_choices(
+    units,
+    skip_keys,
+    manual_targets,
+    *,
+    prefix="",
+    official_terms=None,
+    translate_npc: bool = True,
+    reviewed_keep_keys: ReviewedKeepKeys | None = None,
+):
     from .quality import validate_reuse
     from .task_records import unit_key
     for unit in units:
         key = unit_key([], prefix + unit.file_path, unit.format, unit.locator, unit.source_text)
         npc_skip = (not translate_npc) and unit.metadata.get("display_kind") == "entity_display_name"
+        reviewed_reason = (reviewed_keep_keys or {}).get(key)
         if key in skip_keys or npc_skip:
             unit.final_target = unit.source_text
             unit.metadata["desktop_skip"] = True
@@ -1391,6 +1481,15 @@ def _apply_desktop_choices(units, skip_keys, manual_targets, *, prefix="", offic
             # of its same-source group unless the group holds a competing
             # revision (then each context keeps its own wording).
             unit.metadata["desktop_revision"] = True
+        elif isinstance(reviewed_reason, str) and reviewed_reason.startswith("reviewed_"):
+            # This keep came from an explicit human review in the newest report
+            # for this exact input version. It is a decision, not a translation
+            # draft: keep the source visible, record its reason, and skip AI.
+            from .quality import INTENTIONAL_KEEP
+
+            unit.final_target = None
+            unit.metadata[INTENTIONAL_KEEP] = {"reason": reviewed_reason, "origin": "reviewed_report"}
+            unit.metadata["desktop_skip"] = True
 
 
 def _resolve_official_terms(
@@ -2180,6 +2279,7 @@ def _process_nested_archives(
     official_terms: OfficialTermIndex | None = None,
     skip_unit_keys: set[str] | None = None,
     manual_targets: dict[str, str] | None = None,
+    reviewed_keep_keys: ReviewedKeepKeys | None = None,
     translate_npc: bool = True,
     task_root: Path | None = None,
     input_fingerprint: str = "",
@@ -2263,7 +2363,15 @@ def _process_nested_archives(
             # already carry it, or sibling archives collide (B2).
             _mark_archive_identity(scan_result.text_units, archive_rel)
             _apply_seed_targets(scan_result.text_units, nested_seeds)
-            _apply_desktop_choices(scan_result.text_units, skip_unit_keys or set(), manual_targets or {}, prefix=f"{archive_rel}!/", official_terms=official_terms, translate_npc=translate_npc)
+            _apply_desktop_choices(
+                scan_result.text_units,
+                skip_unit_keys or set(),
+                manual_targets or {},
+                prefix=f"{archive_rel}!/",
+                official_terms=official_terms,
+                translate_npc=translate_npc,
+                reviewed_keep_keys=reviewed_keep_keys,
+            )
             groups_before = int(getattr(translator, "groups_completed", 0))
             if progress is not None:
                 # Count this archive's units into the task total. A per-event
@@ -2538,6 +2646,7 @@ def run_translation(
     official_terms_version: str | None = None,
     skip_unit_keys: set[str] | None = None,
     manual_targets: dict[str, str] | None = None,
+    reviewed_keep_keys: ReviewedKeepKeys | None = None,
     translate_npc: bool = True,
     _preflight: bool = True,
     _write_failure_log: bool = True,
@@ -2597,7 +2706,14 @@ def run_translation(
         scan_result = scan(working_root, registry, cancel_event=cancel_event, input_fingerprint=input_fingerprint)
         scan_result.text_units = _filter_excluded_units(scan_result.text_units, excluded_paths)
         _apply_seed_targets(scan_result.text_units, combined_seeds)
-        _apply_desktop_choices(scan_result.text_units, skip_unit_keys or set(), manual_targets or {}, official_terms=official_index, translate_npc=translate_npc)
+        _apply_desktop_choices(
+            scan_result.text_units,
+            skip_unit_keys or set(),
+            manual_targets or {},
+            official_terms=official_index,
+            translate_npc=translate_npc,
+            reviewed_keep_keys=reviewed_keep_keys,
+        )
         progress.begin_scanned(len(scan_result.text_units))
         _emit(
             progress_callback,
@@ -2657,6 +2773,7 @@ def run_translation(
             official_terms=official_index,
             skip_unit_keys=skip_unit_keys,
             manual_targets=manual_targets,
+            reviewed_keep_keys=reviewed_keep_keys,
             translate_npc=translate_npc,
             task_root=task_root or (working_root / ".mc-hanhua"),
             input_fingerprint=input_fingerprint,
@@ -2885,6 +3002,10 @@ def translate_archive_to_file(
         run_kwargs.setdefault(
             "seed_translations",
             load_prior_translation_seeds(reports_dir, input_path, fallback_dirs=(legacy_cache_dir,)),
+        )
+        run_kwargs.setdefault(
+            "reviewed_keep_keys",
+            load_prior_reviewed_keep_keys(reports_dir, input_path, fallback_dirs=(legacy_cache_dir,)),
         )
         # The working directory deliberately lives beside the final archive. This avoids
         # cross-drive temp permissions and makes the final move an atomic same-volume rename.

@@ -61,7 +61,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import TextUnit
-from .quality import STRUCTURAL_TOKEN_PATTERNS, structural_tokens_match
+from .quality import COMMAND_RE, STRUCTURAL_TOKEN_PATTERNS, URL_RE, structural_tokens_match
 from .text_components import (
     _COMMAND_PAYLOAD_RE,
     _command_payload_view,
@@ -228,6 +228,89 @@ def token_difference(source: str, target: str) -> list[str]:
         after = Counter(match.group(0) for match in pattern.finditer(target))
         differences.extend(sorted((before - after) | (after - before)))
     return differences
+
+
+def embedded_display_command_preserves_mechanisms(source: str, target: str) -> bool:
+    """Prove that a supported embedded display command kept its mechanisms.
+
+    Book pages can contain JSON click-event values that themselves hold a
+    ``tellraw`` or ``title`` command, or a plain ``/say `` command with one
+    display-only body. The outer book audit cannot treat that whole value as
+    writable: this independent check first preserves the command shell, JSON
+    payload skeleton or plain-message boundary, structural tokens, and any
+    nested interaction layout. Callers may mask the value in their container
+    skeleton only after this returns true. Other plain commands remain closed.
+    """
+
+    source_say_body = _embedded_say_command_body(source)
+    target_say_body = _embedded_say_command_body(target)
+    if source_say_body is not None or target_say_body is not None:
+        return (
+            source_say_body is not None
+            and target_say_body is not None
+            and structural_tokens_match(source, target)
+        )
+
+    source_skeleton = _embedded_display_command_skeleton(source)
+    target_skeleton = _embedded_display_command_skeleton(target)
+    if source_skeleton is None or target_skeleton is None or source_skeleton != target_skeleton:
+        return False
+    if not structural_tokens_match(source, target):
+        return False
+    source_scope, source_leaves = _audit_render(source)
+    target_scope, target_leaves = _audit_render(target)
+    if not source_scope or not target_scope or source_leaves is None or target_leaves is None:
+        return False
+    if _interaction_differences(source_leaves, target_leaves):
+        return False
+    return _audit_fixed_divider_rows(source) == _audit_fixed_divider_rows(target)
+
+
+_EMBEDDED_SAY_UNSAFE_SEPARATORS = ("\n", "\r", "\x00", "\u2028", "\u2029", ";", "&&", "||")
+
+
+def _embedded_say_command_body(command: str) -> str | None:
+    """Read the body of the sole explicitly supported plain command shape."""
+
+    prefix = "/say "
+    if not command.startswith(prefix):
+        return None
+    body = command[len(prefix) :]
+    if not body or not body.strip() or any(separator in command for separator in _EMBEDDED_SAY_UNSAFE_SEPARATORS):
+        return None
+    # A second command token cannot be treated as message text by this narrow
+    # exception. Strip complete URLs first because a URL path may look like a
+    # slash command; the shared token comparison still requires it unchanged.
+    if COMMAND_RE.search(URL_RE.sub(" ", body)):
+        return None
+    return body
+
+
+def _embedded_display_command_skeleton(command: str) -> Any | None:
+    """Return the command shell plus its display-folded JSON skeleton."""
+
+    state, payload = _payload_state(command)
+    if state != "json":
+        return None
+    command_start = _find_execute_run(command)
+    if command_start is None:
+        command_start = 0
+    tail = command[command_start:]
+    match = _COMMAND_PAYLOAD_RE.match(tail)
+    if match is None:
+        return None
+    remainder = tail[match.end() :]
+    start = _find_json_start(remainder)
+    end = _matching_json_end(remainder, start) if start >= 0 else None
+    if start < 0 or end is None:
+        return None
+    absolute_start = command_start + match.end() + start
+    absolute_end = command_start + match.end() + end
+    return (
+        command[:absolute_start],
+        json_skeleton(payload, fold_text=True),
+        command[absolute_end:],
+    )
 
 
 def audit_mechanism_skeleton(
