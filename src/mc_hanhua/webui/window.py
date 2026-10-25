@@ -16,6 +16,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QSystemTrayIcon, QVBoxLayout, QWidget
 
 from mc_hanhua.gui_support import StartupRequest
+from mc_hanhua.map_version import default_output_path
 from mc_hanhua.webui.controller import TaskController, model_request_is_current, unique_output_path
 from mc_hanhua.webui.paths import app_page_path, ensure_page_icon, icon_path
 from mc_hanhua.webui.present import bank_logs, clamp_zoom, classify_titlebar_press, drop_plan, queue_advance
@@ -426,6 +427,19 @@ class HtmlMainWindow(QMainWindow):
             return self.controller.set_output(Path(text))
         if command == "set_npc":
             return self.controller.set_npc(bool(payload.get("enabled")))
+        if command == "set_passage_sentence":
+            if self.controller.busy:
+                return self.controller.snapshot(ok=False, error="任务进行中，不能更改整句翻译设置。")
+            return self.controller.set_passage_sentence(bool(payload.get("enabled")))
+        if command == "choose_passage_names":
+            if self.controller.busy:
+                return self.controller.snapshot(ok=False, error="任务进行中，不能更改名称配置。")
+            path, _ = QFileDialog.getOpenFileName(self, "选择地图名称配置", "", "名称配置 (*.json);;All files (*.*)")
+            return self.controller.set_passage_names(path) if path else self.controller.snapshot(ok=True)
+        if command == "clear_passage_names":
+            if self.controller.busy:
+                return self.controller.snapshot(ok=False, error="任务进行中，不能更改名称配置。")
+            return self.controller.set_passage_names("")
         if command == "apply_connection":
             return self.controller.apply_connection(payload)
         if command == "fetch_models":
@@ -597,7 +611,7 @@ class HtmlMainWindow(QMainWindow):
         else:
             folder = QFileDialog.getExistingDirectory(self, "选择输出目录")
             if folder:
-                return self.controller.set_output(Path(folder) / f"{input_path.name}_zh_cn")
+                return self.controller.set_output(default_output_path(input_path, Path(folder)))
         return self.controller.snapshot(ok=True)
 
     def _start_scan(self) -> dict:

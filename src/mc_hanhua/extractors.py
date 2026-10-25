@@ -86,6 +86,29 @@ NON_SOURCE_LOCALE_RE = re.compile(r"/(?!en_us)[a-z]{2}_[a-z]{2}/")
 DATAPACK_NAMESPACE_RE = re.compile(r"(?:^|/)data/[^/]+/")
 
 
+def _target_lang_filename(source_path: Path) -> str:
+    """Legacy ``.lang`` target name mirroring the source casing.
+
+    Minecraft <=1.10 only loads ``zh_CN.lang`` (case-sensitive in zips) while
+    1.11-1.12 use ``zh_cn.lang``; ``en_US.lang`` -> ``zh_CN.lang``,
+    ``en_us.lang`` -> ``zh_cn.lang``.
+    """
+
+    _, _, region = source_path.stem.partition("_")
+    upper = region.isupper()
+    return f"{TARGET_LANG[:2]}_{TARGET_LANG[3:].upper() if upper else TARGET_LANG[3:]}.lang"
+
+
+def _lang_name_variants(target_path: Path) -> list[Path]:
+    """Existing files in the folder whose name equals ``target_path`` ignoring case."""
+
+    folder = target_path.parent
+    if not folder.is_dir():
+        return []
+    wanted = target_path.name.lower()
+    return [p for p in folder.iterdir() if p.name.lower() == wanted and p.is_file()]
+
+
 def _rel(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
@@ -203,20 +226,27 @@ class LegacyLangPlugin(ExtractorPlugin, WriterPlugin):
         return units
 
     def write(self, root: Path, path: Path, units: list[TextUnit]) -> int:
-        target_path = path.with_name(f"{TARGET_LANG}.lang")
+        target_path = path.with_name(_target_lang_filename(path))
         existing: dict[str, str] = {}
-        if target_path.exists():
-            for line in read_text(target_path).splitlines():
+        variants = _lang_name_variants(target_path)
+        # Merge any pre-existing zh_cn/zh_CN variant (target-cased one last so it wins).
+        for variant in sorted(variants, key=lambda p: p.name == target_path.name):
+            for line in read_text(variant).splitlines():
                 if line and not line.lstrip().startswith("#") and "=" in line:
                     key, value = line.split("=", 1)
                     existing[key] = value
+        stale = [p for p in variants if p.name != target_path.name]
         changed = 0
         for unit in units:
             key = str(unit.metadata.get("key", ""))
             if key and unit.final_target is not None and existing.get(key) != unit.final_target:
                 existing[key] = unit.final_target
                 changed += 1
-        if changed:
+        if changed or stale:
+            # Remove wrongly-cased files first: on case-insensitive filesystems
+            # writing target_path would otherwise keep the old file name.
+            for old in variants:
+                old.unlink()
             write_text(target_path, "\n".join(f"{key}={value}" for key, value in existing.items()) + "\n")
         return changed
 
@@ -626,7 +656,15 @@ class McfunctionPlugin(ExtractorPlugin, WriterPlugin):
                     unit.metadata["writeback_status"] = "failed"
                     _emit_command_writeback(unit, "failed", "line_missing")
                 continue
+            handled, line_changed = _write_passages(_rel(root, path), line_no, lines, original_lines[line_no], line_units)
+            changed += line_changed
             for unit, command_locator in sorted(line_units, key=lambda item: command_locator_offset(item[1]), reverse=True):
+                if unit.id in handled:
+                    continue
+                if unit.final_target is None:
+                    unit.metadata["writeback_status"] = "blocked"
+                    _emit_command_writeback(unit, "blocked", "passage_rollback")
+                    continue
                 if not command_locator_is_valid(lines[line_no], command_locator):
                     unit.metadata["writeback_status"] = "failed"
                     _emit_command_writeback(unit, "failed", "locator_missing")
@@ -661,6 +699,86 @@ class McfunctionPlugin(ExtractorPlugin, WriterPlugin):
         if changed:
             write_text(path, "\n".join(lines) + "\n")
         return changed
+
+
+def _write_passages(
+    rel: str,
+    line_no: int,
+    lines: list[str],
+    source_line: str,
+    line_units: list[tuple[TextUnit, dict[str, object]]],
+) -> tuple[set[str], int]:
+    """Write each bound passage of one line atomically (DEVELOPMENT §3.12).
+
+    The passage is recomputed from the *input* line and every member is applied
+    at once; any failure returns every member of that passage to its
+    pre-adoption value, so a line never holds half of a revised passage.
+    Returns the ids written here and whether the line changed.
+    """
+
+    from .passage_layout import PASSAGE_METADATA, check_line, compose_line, passage_id
+    from .passage_revisions import rollback_member
+
+    groups: dict[str, list[tuple[TextUnit, dict[str, object]]]] = defaultdict(list)
+    for unit, command_locator in line_units:
+        meta = unit.metadata.get(PASSAGE_METADATA)
+        if isinstance(meta, dict):
+            groups[str(meta["id"])].append((unit, command_locator))
+    handled: set[str] = set()
+    changed = 0
+    reasons: dict[str, str | None] = {}
+    for pid, members in groups.items():
+        meta = members[0][0].metadata[PASSAGE_METADATA]
+        located = [(command_locator, unit.final_target or "") for unit, command_locator in members]
+        if sorted(unit.id for unit, _locator in members) != list(meta["members"]):
+            reasons[pid] = "passage_member_missing"
+        elif passage_id(rel, line_no, int(meta["json_start"]), list(meta["passage_members"]), source_line) != pid:
+            reasons[pid] = "passage_identity_changed"
+        else:
+            reasons[pid] = check_line(source_line, list(meta["passage_members"]), int(meta["json_start"]), located)
+    # A soft-break chain shares one translation: its passages are written
+    # together or not at all (DEVELOPMENT §3.14).
+    units_of_work: list[list[str]] = []
+    seen: set[str] = set()
+    for pid, members in groups.items():
+        if pid in seen:
+            continue
+        chain = list(members[0][0].metadata[PASSAGE_METADATA].get("chain") or [pid])
+        work = [p for p in chain if p in groups] if pid in chain else [pid]
+        seen.update(work)
+        if len(work) != len(chain) or any(groups[p][0][0].metadata[PASSAGE_METADATA].get("chain") != members[0][0].metadata[PASSAGE_METADATA].get("chain") for p in work):
+            for p in work:
+                reasons[p] = reasons.get(p) or "chain_incomplete"
+        failed = next((reasons[p] for p in work if reasons.get(p)), None)
+        if failed is not None:
+            for p in work:
+                reasons[p] = reasons[p] or "chain_incomplete"
+        units_of_work.append(work)
+    for work in units_of_work:
+        reason = next((reasons[p] for p in work if reasons.get(p)), None)
+        located = [(command_locator, unit.final_target or "") for p in work for unit, command_locator in groups[p]]
+        if reason is None:
+            composed, refusals = compose_line(lines[line_no], located)
+            if refusals:
+                reason = refusals[0]
+            else:
+                reason = validate_interactive_command_change(source_line, composed)
+        if reason is not None:
+            for p in work:
+                own = reasons.get(p) or reason
+                for unit, _locator in groups[p]:
+                    rollback_member(unit, own)
+                    _emit_command_writeback(unit, "blocked", f"passage_rollback:{own}")
+            continue
+        status = "changed" if composed != lines[line_no] else "unchanged"
+        if status == "changed":
+            lines[line_no] = composed
+            changed = 1
+        for p in work:
+            for unit, _locator in groups[p]:
+                unit.metadata["writeback_status"] = status
+                handled.add(unit.id)
+    return handled, changed
 
 
 class NbtTextPlugin(ExtractorPlugin, WriterPlugin):
@@ -839,12 +957,21 @@ def _collect_nbt_units(
                 mechanism_refs.update(collect_mechanism_refs(tag.value))
             if commands is not None:
                 commands.append((rel, tag.value))
-            for command_locator, text in extract_command_texts(
+            command_units = extract_command_texts(
                 tag.value, filtered_counts, filtered_details=filtered_details, file_path=rel
-            ):
+            )
+            contexts = interactive_leaf_contexts(tag.value)
+            extracted_pointers = {
+                str(locator.get("pointer")) for locator, _ in command_units if locator.get("kind") == "json"
+            }
+            for command_locator, text in command_units:
                 locator = {"path": path, "command": command_locator}
                 if chunk_id is not None:
                     locator["chunk"] = chunk_id
+                metadata = {}
+                declared = _interactive_leaf_metadata(command_locator, contexts, extracted_pointers)
+                if declared is not None:
+                    metadata[INTERACTIVE_LEAF_METADATA] = declared
                 units.append(
                     apply_unit_policy(
                         TextUnit(
@@ -855,6 +982,7 @@ def _collect_nbt_units(
                             locator=json.dumps(locator, ensure_ascii=False),
                             context="/".join(map(str, path)),
                             risk_level=RiskLevel.HIGH,
+                            metadata=metadata,
                         )
                     )
                 )
@@ -1061,12 +1189,19 @@ def _nbt_layout_metadata(root: NbtTag, path: list[str | int], chunk_id: str | No
     """Expose map layout ownership without changing the NBT locator contract."""
 
     lowered = [str(part).lower() for part in path]
-    if "block_entities" in lowered:
-        index = lowered.index("block_entities")
+    block_key = next((key for key in ("block_entities", "tileentities") if key in lowered), None)
+    if block_key is not None:
+        index = lowered.index(block_key)
         if index + 1 < len(path) and isinstance(path[index + 1], int):
             entity_path = path[: index + 2]
             try:
                 entity = get_tag(root, entity_path).value
+                if path and str(path[-1]) in {"Text1", "Text2", "Text3", "Text4"}:
+                    sign_id = str(entity.get("id").value) if entity.get("id") else ""
+                    if sign_id.lower() in {"sign", "minecraft:sign"} or sign_id.lower().endswith("_sign"):
+                        return {"layout_container": "sign", "layout_owner": f"{chunk_id or 'root'}:{entity_path[-1]}:front_text",
+                                "layout_line": int(str(path[-1])[-1]) - 1,
+                                "layout_position": _nbt_block_position(entity)}
                 side_index = next((offset for offset, part in enumerate(lowered) if part in {"front_text", "back_text"}), None)
                 if side_index is not None:
                     side = str(path[side_index])
@@ -1484,7 +1619,13 @@ def read_located_text(root: Path, unit: TextUnit, *, cache: dict[str, Any] | Non
 
 def _read_language_located_text(path: Path, unit: TextUnit) -> str:
     suffix = ".json" if unit.format == "json-lang" else ".lang"
-    target_path = path.with_name(f"{TARGET_LANG}{suffix}")
+    if unit.format == "json-lang":
+        target_path = path.with_name(f"{TARGET_LANG}{suffix}")
+    else:
+        target_path = path.with_name(_target_lang_filename(path))
+        variants = _lang_name_variants(target_path)
+        if variants:
+            target_path = next((p for p in variants if p.name == target_path.name), variants[0])
     if not target_path.is_file():
         raise LocatedTextReadError("missing_file", f"missing {target_path.name}")
     if unit.format == "json-lang":

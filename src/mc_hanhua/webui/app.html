@@ -248,6 +248,14 @@
     <label class="check"><input type="checkbox" id="npc" checked><span>安全时翻译商人 / NPC 标签</span></label>
     <label class="check"><input type="checkbox" id="notifySystem" checked><span>任务完成时发送系统通知</span></label>
     <label class="check"><input type="checkbox" id="notifySound"><span>任务完成时播放提示音</span></label>
+    <label class="check"><input type="checkbox" id="passageSentence"><span>整句翻译被拆开的对白（D，默认关闭）</span></label>
+    <p class="note" id="passageSentenceNote">只处理数据包函数里 tellraw 中同一句被拆成多个片段的对白；每句另发 1～2 次整句请求，需要 Qwen-MT 专用翻译模型（RoH 约 430 段、约 690 次请求）。重跑命中缓存不再请求；失败的段保留逐组件译文。名称配置可选，按地图提供，用于固定专名译法。</p>
+    <div class="field-row">
+      <span class="field-label">名称配置</span>
+      <input id="passageNames" type="text" readonly aria-label="名称配置" placeholder="未选择（可选）">
+      <button type="button" id="choosePassageNames">选择</button>
+      <button type="button" id="clearPassageNames">清除</button>
+    </div>
   </div>
   <div class="dlg-foot"><button type="button" class="primary" id="closePrefs">完成</button></div>
 </dialog>

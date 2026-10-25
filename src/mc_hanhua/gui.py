@@ -44,6 +44,7 @@ from .gui_cards import ContentCardDelegate
 from .gui_styles import STYLESHEET
 from .gui_support import StartupRequest, _parse_startup_request, _protect_text, _unprotect_text
 from .gui_workers import ModelListWorker, ScanPreviewWorker, TranslationWorker
+from .map_version import default_output_path
 from .models import ProgressEvent, TranslationReport, summarize_failure_counts
 from .translator import translator_class_for
 from .utils import UNREADABLE_TEXT_ERRORS
@@ -60,9 +61,7 @@ def _resource_path(relative: str) -> Path:
 
 
 def _archive_output(path: Path) -> Path:
-    if path.suffix.lower() in ARCHIVE_SUFFIXES:
-        return path.with_name(f"{path.stem}_zh_cn{path.suffix}")
-    return path.with_name(f"{path.name}_zh_cn")
+    return default_output_path(path)
 
 
 def _unique_output_path(path: Path) -> Path:
@@ -715,7 +714,7 @@ class MainWindow(QMainWindow):
         else:
             folder = QFileDialog.getExistingDirectory(self, "选择输出目录")
             if folder:
-                self.output_path.setText(str(Path(folder) / f"{input_path.name}_zh_cn"))
+                self.output_path.setText(str(default_output_path(input_path, Path(folder))))
 
     def _set_input(self, path: Path) -> None:
         if self._busy():

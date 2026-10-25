@@ -51,6 +51,13 @@ def is_pure_numeric_or_enum_literal(value: str) -> bool:
     stripped = str(value).strip().lower()
     return stripped in _PURE_ENUM_LITERALS or bool(_PURE_NUMERIC_LITERAL_RE.fullmatch(stripped))
 
+
+def is_pure_numeric_literal(value: str) -> bool:
+    """Whether a complete string is only a number (no boolean/enum words)."""
+
+    return bool(_PURE_NUMERIC_LITERAL_RE.fullmatch(str(value).strip().lower()))
+
+
 # Resource / identity keys that participate in commands, selectors, recipes,
 # predicates, functions, storage, dimensions, scoreboards, teams and bossbars.
 IMMUTABLE_ID_KEYS = {
@@ -245,6 +252,11 @@ def classify_nbt_path(path: list[Any], *, reason_hint: str = "") -> tuple[str, s
     parent_lower = parent.lower()
     lowered = [str(part).lower() for part in path]
 
+    if leaf in {"Text1", "Text2", "Text3", "Text4"} and ({"block_entities", "tileentities"} & set(lowered)):
+        return POLICY_TRANSLATABLE, "legacy sign display line"
+    if leaf_lower in {"membernameprefix", "membernamesuffix"} and "teams" in lowered:
+        return POLICY_TRANSLATABLE, "legacy team display prefix/suffix"
+
     if (parent, leaf) in TRANSLATABLE_PARENTED or (parent_lower, leaf_lower) in {
         (str(a).lower(), str(b).lower()) for a, b in TRANSLATABLE_PARENTED
     }:
@@ -417,6 +429,8 @@ def classify_unit(unit: TextUnit) -> tuple[str, str]:
 
     existing = getattr(unit, "policy", "") or (unit.metadata or {}).get("policy")
     existing_reason = getattr(unit, "policy_reason", "") or (unit.metadata or {}).get("policy_reason") or "preset"
+    if unit.metadata.get("content_preservation") and existing not in {POLICY_IMMUTABLE_ID, POLICY_IMMUTABLE_MATCH}:
+        return POLICY_UNKNOWN, "suspected cipher display container; human review required"
     if unit.format in {"json-lang", "legacy-lang"}:
         # Language files contain player-facing values by definition. In
         # particular, a value such as "None" may have an official Chinese

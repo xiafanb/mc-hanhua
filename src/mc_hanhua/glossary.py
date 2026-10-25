@@ -5,7 +5,9 @@ import json
 import re
 from pathlib import Path
 
+from .font_overrides import FontOverrides
 from .models import GlossaryEntry
+from .names import mask_names
 
 BUILTIN_ENTRIES = [
     GlossaryEntry("Overworld", "主世界", "Minecraft dimension", 10),
@@ -28,6 +30,7 @@ class Glossary:
         # the LATER entry (higher priority) wins in the exact map. This is the
         # observable precedence: user glossary > existing zh_cn pairs > builtin.
         self.exact = {entry.source.lower(): entry.target for entry in self.entries}
+        self.font_overrides: FontOverrides | None = None
 
     @classmethod
     def builtin(cls) -> Glossary:
@@ -78,6 +81,38 @@ class Glossary:
         return source.strip().lower() in self.exact
 
     def mask_terms(self, text: str) -> tuple[str, dict[str, str]]:
+        """Mask icons, glossary terms, then player/author names, as {termN} tokens."""
+
+        masked, mapping = self._mask_icons_and_terms(text)
+        masked, names = mask_names(masked, self.has_entry)
+        return masked, {**mapping, **names}
+
+    def _mask_icons_and_terms(self, text: str) -> tuple[str, dict[str, str]]:
+        """Mask pack-redrawn icon characters, then glossary terms, as {termN} tokens."""
+
+        pattern = self.font_overrides.pattern() if self.font_overrides else None
+        if pattern is None or not text:
+            return self._mask_glossary(text)
+        icons: dict[str, str] = {}
+        index = 0
+
+        def swap(match: re.Match[str]) -> str:
+            nonlocal index
+            token = f"{{term{index}}}"
+            while token in text:
+                index += 1
+                token = f"{{term{index}}}"
+            icons[token] = match.group(0)
+            index += 1
+            return token
+
+        masked = pattern.sub(swap, text)
+        if not icons:
+            return self._mask_glossary(text)
+        masked, mapping = self._mask_glossary(masked)
+        return masked, {**icons, **mapping}
+
+    def _mask_glossary(self, text: str) -> tuple[str, dict[str, str]]:
         """Replace highest-priority term occurrences with immutable {termN} tokens.
 
         The tokens match PLACEHOLDER_RE so every downstream guard (placeholder

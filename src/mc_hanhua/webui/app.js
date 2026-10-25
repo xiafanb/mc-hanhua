@@ -317,6 +317,15 @@ function applySnapshot(data) {
   const prefs = data.prefs || {};
   $("notifySystem").checked = prefs.notify_system !== false;
   $("notifySound").checked = !!prefs.notify_sound;
+  const sentence = data.passage_sentence || {};
+  $("passageSentence").checked = !!sentence.enabled;
+  $("passageSentence").disabled = !!data.busy;
+  $("passageNames").value = sentence.names || "";
+  $("choosePassageNames").disabled = !!data.busy;
+  $("clearPassageNames").disabled = !!data.busy || !sentence.names;
+  const note = $("passageSentenceNote");
+  note.dataset.base = note.dataset.base || note.textContent;
+  note.textContent = note.dataset.base + (sentence.enabled && !sentence.ready ? "（当前模型不是 Qwen-MT，开启后不会执行。）" : "");
   $("npc").checked = data.npc !== false;
   // Keep in-progress dialog edits intact while snapshot pushes stream in
   // (e.g. the async model list arriving after fetch_models).
@@ -598,6 +607,9 @@ document.querySelector(".tabs").addEventListener("keydown", (event) => {
   document.querySelector(".tabs button.active").focus();
 });
 $("npc").addEventListener("change", () => call("set_npc", {enabled: $("npc").checked}));
+$("passageSentence").addEventListener("change", () => call("set_passage_sentence", {enabled: $("passageSentence").checked}));
+$("choosePassageNames").addEventListener("click", () => call("choose_passage_names"));
+$("clearPassageNames").addEventListener("click", () => call("clear_passage_names"));
 $("autoContinue").addEventListener("change", () => call("set_auto_continue", {enabled: $("autoContinue").checked}));
 $("notifySystem").addEventListener("change", () => call("set_notify", {system: $("notifySystem").checked}));
 $("notifySound").addEventListener("change", () => call("set_notify", {sound: $("notifySound").checked}));

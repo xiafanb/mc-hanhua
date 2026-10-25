@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from .models import RiskLevel, TextUnit, TranslationGroup
+from .content_safety import candidate_content_reason, display_container_identity
+from .models import RiskLevel, TextUnit, TranslationGroup, structured_locator
 from .text_components import (
     INTERACTIVE_LEAF_METADATA,
     ROW_PAD,
@@ -18,14 +19,14 @@ from .text_components import (
     control_row_pad,
     split_encoded_component_locator,
 )
-from .utils import PLACEHOLDER_RE, normalize_layout_newlines, placeholder_tokens_match, stable_id
+from .utils import PLACEHOLDER_RE, normalize_layout_newlines, peel_text_edges, placeholder_tokens_match, stable_id
 
 #: Rule generation for every stored candidate.  Raised whenever the gate's
 #: acceptance changes, so rows written under an older grammar become unreachable
 #: instead of answering a rule set they were never judged by.
-QUALITY_CACHE_VERSION = "context-v8"
-BOOK_CACHE_VERSION = "book-context-v3"
-LAYOUT_CACHE_VERSION = "layout-v3"
+QUALITY_CACHE_VERSION = "context-v9"
+BOOK_CACHE_VERSION = "book-context-v4"
+LAYOUT_CACHE_VERSION = "layout-v4"
 #: Name of the input-version-scoped translation memory. The rule generation is
 #: part of the file name (as it is part of every context key) because rows
 #: written under an older grammar are unreachable and must not look like a
@@ -205,9 +206,8 @@ def _json_owner(locator: str) -> tuple[str, str]:
 
 
 def _nbt_owner(unit: TextUnit) -> tuple[str, str]:
-    try:
-        locator = json.loads(unit.locator)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    locator = structured_locator(unit)
+    if locator is None:
         return unit.context or "nbt", "nbt"
     raw_path = locator.get("path", [])
     parts = [str(part) for part in raw_path] if isinstance(raw_path, list) else unit.context.split("/")
@@ -340,7 +340,9 @@ def _chunk_members(
         # Over-budget books split on a page boundary, never inside pages/N.
         page_break = book_container and exceeds_chars and page is not None and current_page is not None and page != current_page
         exceeds = (not book_container and (exceeds_segments or exceeds_chars)) or page_break
-        if current and (separated or exceeds):
+        same_payload = bool(current and display_container_identity(unit) is not None
+                            and display_container_identity(unit) == display_container_identity(current[-1]))
+        if current and (separated or exceeds) and not same_payload:
             chunks.append((len(chunks), current))
             current = []
             current_chars = 0
@@ -386,7 +388,7 @@ def _unit_order(unit: TextUnit) -> tuple:
         return (0, _json_pointer_order(unit.locator), unit.context)
     if semantic_owner(unit)[1] == "book":
         try:
-            path = json.loads(unit.locator).get("path", [])
+            path = (structured_locator(unit) or {}).get("path", [])
             page_index = next(i for i, part in enumerate(path) if part == "pages")
             page = int(path[page_index + 1])
             tail = path[page_index + 2:]
@@ -499,6 +501,8 @@ def looks_like_chinese_target(text: str) -> bool:
 
 _SHORT_UPPER_LABEL_RE = re.compile(r"^[A-Z]{2,6}$")
 _SHORT_WORD_LABEL_RE = re.compile(r"^[A-Za-z]{1,8}$")
+_BRACKET_PLACEHOLDER_RE = re.compile(r"^(?:\[[A-Z0-9_]+\]|\{[A-Z0-9_]+\}|<[A-Z0-9_]+>)$")
+_VOWELLESS_RUN_RE = re.compile(r"^[A-Za-z]{6,}$")
 
 
 def keepable_short_label(text: str) -> bool:
@@ -509,12 +513,16 @@ def keepable_short_label(text: str) -> bool:
     marker) to prove that a source it is about to skip really was such a label.
     """
 
-    stripped = (text or "").strip()
+    stripped = peel_text_edges((text or "").strip())[1].strip()
     if not stripped or "\n" in text or " " in stripped:
         return False
     if _SHORT_UPPER_LABEL_RE.fullmatch(stripped):
         return True
     if _SHORT_WORD_LABEL_RE.fullmatch(stripped) and "." not in stripped:
+        return True
+    if _BRACKET_PLACEHOLDER_RE.fullmatch(stripped):
+        return True
+    if _VOWELLESS_RUN_RE.fullmatch(stripped) and not re.search(r"[aeiouyAEIOUY]", stripped):
         return True
     return False
 
@@ -555,6 +563,9 @@ def validate_contextual_target(source: str, target: str, strict_newlines: bool =
 
     if not structural_tokens_match(source, target):
         return "structural_token"
+    content_reason = candidate_content_reason(source, target)
+    if content_reason:
+        return content_reason
     if strict_newlines and "\n" in source:
         if target.count("\n") != source.count("\n") or _blank_line_indices(source) != _blank_line_indices(target):
             return "newline_structure"
@@ -570,6 +581,36 @@ class ReuseResult(NamedTuple):
 
     normalized: str | None
     reason: str | None
+
+
+def validate_passage_member(unit: TextUnit, candidate: object) -> str | None:
+    """Per-member gate of a passage revision (§3.12); ``None`` = acceptable.
+
+    Every check of ``validate_reuse`` that is not about line shape applies
+    unchanged: tokens, content rules, length, emptiness and puzzle protection.
+    The two shape rules — per-member break count / rebuild and the +1 break cap —
+    are replaced by passage-level conservation in ``passage_layout``, which the
+    caller must run on the whole passage.  The candidate is never rewritten: a
+    member that would need normalising is refused instead.
+    """
+
+    if not isinstance(candidate, str):
+        return "invalid_candidate_type"
+    source = unit.source_text
+    if unit.metadata.get("content_preservation") and candidate != source:
+        return "puzzle_content"
+    if normalize_candidate_scaffolding(unit, candidate) != candidate:
+        return "candidate_scaffolding"
+    if not structural_tokens_match(source, candidate):
+        return "structural_token"
+    content_reason = candidate_content_reason(source, candidate)
+    if content_reason:
+        return content_reason
+    if len(candidate.strip()) > max(80, len(source.strip()) * 4 + 16):
+        return "unexpected_expansion"
+    if source.strip() and not candidate.strip():
+        return "empty_candidate"
+    return None
 
 
 @dataclass(frozen=True)
@@ -812,6 +853,9 @@ def _break_rank(text: str, position: int, spans: list[tuple[int, int]]) -> int |
         return 0
     if before.isspace() or before in _CLAUSE_ENDS:
         return 1
+    if before == after and _is_wide(before):
+        # Reduplicated word (看看, 慢慢): legal, but the worst place to cut.
+        return 3
     if _is_wide(before) or _is_wide(after):
         return 2
     return 3
@@ -881,19 +925,32 @@ def _wrap_prose(
         # the author's, and re-wrapping them would only move text around.
         return list(texts)
     stream = _join_lines(texts)
-    if len(stream) < minimum * len(slots):
+    # Line minimums count visible characters: a cut that leaves only the
+    # stream's trailing space on the last line yields a blank prose line, which
+    # the next pass treats as a dropped line and re-wraps differently.
+    visible_after = [0] * (len(stream) + 1)
+    for index in range(len(stream) - 1, -1, -1):
+        visible_after[index] = visible_after[index + 1] + (not stream[index].isspace())
+    if visible_after[0] < minimum * len(slots):
         return None
     spans = _token_spans(stream)
     weights = [1 for _slot in slots] if uniform_line_width else [max(1, _display_width(slot.strip())) for slot in slots]
     total = sum(weights)
     width = _display_width(stream)
     cuts: list[int] = []
-    lower = minimum
+    line_start = 0
     consumed = 0
     for slot_index, weight in enumerate(weights[:-1]):
         consumed += weight
         remaining_slots = len(slots) - slot_index - 1
-        upper = len(stream) - minimum * remaining_slots
+        lower = line_start + 1
+        while lower < len(stream) and visible_after[line_start] - visible_after[lower] < minimum:
+            lower += 1
+        upper = len(stream) - 1
+        while upper >= lower and visible_after[upper] < minimum * remaining_slots:
+            upper -= 1
+        if upper < lower:
+            return None
         position = _pick_break(
             stream,
             _width_index(stream, consumed / total * width),
@@ -905,7 +962,7 @@ def _wrap_prose(
         if position is None:
             return None
         cuts.append(position)
-        lower = position + minimum
+        line_start = position
     lines: list[str] = []
     start = 0
     for position in [*cuts, len(stream)]:
@@ -1467,7 +1524,8 @@ def _passage_element_key(unit: TextUnit) -> tuple[str, int] | None:
         # (outer pointer + inner component pointer), so the lore lines of one
         # item are one passage while two items' lore lines are not.
         outer, inner = _json_locator_pointers(unit.locator)
-        return _element_key_in_pointer(f"{outer}{inner}")
+        key = _element_key_in_pointer(f"{outer}{inner}")
+        return (f"{unit.file_path}:{key[0]}", key[1]) if key else None
     command = locator.get("command") if isinstance(locator, dict) else None
     if not isinstance(command, dict):
         return None
@@ -1477,7 +1535,11 @@ def _passage_element_key(unit: TextUnit) -> tuple[str, int] | None:
         index = command.get("snbt_index")
         if not path or not isinstance(index, int):
             return None
-        return (f"snbt:{path}:{command.get('json')}", index)
+        identity = display_container_identity(unit)
+        # The element index differs between list siblings, so use the command's
+        # actual owner rather than its display-container identity here.
+        owner = (unit.file_path, locator.get("chunk"), locator.get("path"), locator.get("line"), path, command.get("json"))
+        return (f"snbt:{json.dumps(owner, ensure_ascii=False)}", index) if identity else None
     if kind == "json":
         start = command.get("json_start")
         pointer = str(command.get("pointer") or "")
@@ -1486,7 +1548,7 @@ def _passage_element_key(unit: TextUnit) -> tuple[str, int] | None:
         key = _element_key_in_pointer(pointer)
         if key is None:
             return None
-        return (f"json:{start}:{key[0]}", key[1])
+        return (f"json:{display_container_identity(unit)}:{key[0]}", key[1])
     return None
 
 
@@ -1636,6 +1698,13 @@ def stamp_fragment_merges(
     return stamped
 
 
+def normalize_candidate_scaffolding(unit: TextUnit, candidate: str) -> str:
+    """Remove only the known leading book prompt label, never visible content."""
+    if is_book_page_unit(unit) and not re.match(r"^\s*\[page=", unit.source_text):
+        return re.sub(r"^\s*\[page=(?:\d+|未知)\][ \t]*", "", candidate)
+    return candidate
+
+
 def validate_reuse(
     unit: TextUnit,
     candidate: object,
@@ -1658,11 +1727,10 @@ def validate_reuse(
 
     if not isinstance(candidate, str):
         return ReuseResult(None, "invalid_candidate_type")
-    text = candidate
+    if unit.metadata.get("content_preservation") and candidate != unit.source_text:
+        return ReuseResult(None, "puzzle_content")
+    text = normalize_candidate_scaffolding(unit, candidate)
     rule = newline_rule(unit)
-    if is_book_page_unit(unit) and not re.match(r"^\s*\[page=", unit.source_text):
-        # Prompt page labels are context, never part of the displayed page.
-        text = re.sub(r"^\s*\[page=(?:\d+|未知)\][ \t]*", "", text)
     if rule.repair:
         text = normalize_layout_newlines(unit.source_text, text)
     # A proven TextDisplay renders real line breaks, but the map may author them

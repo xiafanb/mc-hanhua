@@ -271,6 +271,44 @@ def restore_boundary_newlines(source: str, target: str) -> str:
     return prefix + target + suffix
 
 
+_EDGE_CODE = r"(?:\s|§[0-9a-fk-orA-FK-OR])"
+_LEADING_EDGE_RE = re.compile(rf"^{_EDGE_CODE}+")
+_TRAILING_EDGE_RE = re.compile(rf"{_EDGE_CODE}+$")
+
+
+def peel_text_edges(text: str) -> tuple[str, str, str]:
+    """Split ``text`` into ``(leading, core, trailing)`` edges of whitespace and ``§`` codes.
+
+    Whole-edge text (no core) is returned unpeeled so it keeps its old handling.
+    """
+
+    leading = _LEADING_EDGE_RE.match(text)
+    head = leading.group(0) if leading else ""
+    rest = text[len(head) :]
+    trailing = _TRAILING_EDGE_RE.search(rest)
+    tail = trailing.group(0) if trailing else ""
+    core = rest[: len(rest) - len(tail)]
+    if not core.strip():
+        return "", text, ""
+    return head, core, tail
+
+
+def reattach_text_edges(leading: str, trailing: str, reply: str) -> str:
+    """Put the exact original edges around a model reply that only saw the core.
+
+    A reply that echoed the formatting codes of an edge is not given them twice.
+    """
+
+    body = reply.strip()
+    head = leading.strip()
+    if head and body.startswith(head):
+        body = body[len(head) :].lstrip()
+    tail = trailing.strip()
+    if tail and body.endswith(tail):
+        body = body[: len(body) - len(tail)].rstrip()
+    return leading + body + trailing
+
+
 def normalize_layout_newlines(source: str, target: str) -> str:
     """Restore escaped internal breaks for map text that was originally multiline.
 
@@ -282,6 +320,56 @@ def normalize_layout_newlines(source: str, target: str) -> str:
     if "\n" not in source or "\\n" not in target:
         return target
     return target.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+
+def restore_line_padding(source: str, target: str) -> str:
+    """Give back alignment padding (>=2 leading spaces) a translated line lost.
+
+    Only applies when both texts have the same number of lines; lines that
+    already carry at least the source's padding are left untouched.
+    """
+
+    if "\n" not in source or "\n" not in target:
+        return target
+    source_lines = source.split("\n")
+    target_lines = target.split("\n")
+    if len(source_lines) != len(target_lines):
+        return target
+    changed = False
+    for index, (src, dst) in enumerate(zip(source_lines, target_lines)):
+        pad = len(src) - len(src.lstrip(" "))
+        if pad < 2 or not src.strip() or not dst.strip():
+            continue
+        have = len(dst) - len(dst.lstrip(" "))
+        if have < pad:
+            target_lines[index] = " " * pad + dst.lstrip(" ")
+            changed = True
+    return "\n".join(target_lines) if changed else target
+
+
+_RESIDUE_RE = re.compile(r"(?<![A-Za-z])([a-z]{2,})(?=[一-鿿])|(?<=[一-鿿])([a-z]{2,})(?![A-Za-z])")
+_RESIDUE_SKIP = frozenset("kg cm mm km hp xp fps id ui ms mb gb kb hz px pm am".split())
+_MARKUP_RE = re.compile(r"§[0-9a-fk-orA-FK-OR]|\{[^{}]*\}|%(?:\d+\$)?[sdf]|https?://\S+")
+
+
+def source_residue_fragments(source: str, target: str) -> list[str]:
+    """Lowercase Latin fragments glued to CJK in the target that come from the source.
+
+    A hint for review only (e.g. an untranslated word left stuck to a translation).
+    """
+
+    if source.lstrip().startswith("/") or not re.search(r"[一-鿿]", target):
+        return []
+    clean_source = _MARKUP_RE.sub(" ", source).lower()
+    clean_target = _MARKUP_RE.sub(" ", target)
+    found: list[str] = []
+    for match in _RESIDUE_RE.finditer(clean_target):
+        word = match.group(1) or match.group(2)
+        if word in _RESIDUE_SKIP or word in found:
+            continue
+        if re.search(rf"(?<![a-z]){re.escape(word)}|{re.escape(word)}(?![a-z])", clean_source) and word in clean_source:
+            found.append(word)
+    return found
 
 
 def looks_like_chinese_translation(text: str) -> bool:

@@ -242,7 +242,23 @@ class OfficialTermIndex:
         # exactly. Only free text that merely *embeds* a term is still enforced.
         if own_term is not None or self._resolves_to_own_entry(key, source_text, game_version):
             return None
-        for term in self.terms_for_context(source_text, role, game_version):
+        for term in _maximal_context_terms(source_text, self.terms_for_context(source_text, role, game_version)):
             if term.target not in target_text:
                 return "official_term_conflict"
         return None
+
+
+def _maximal_context_terms(source: str, terms: list[OfficialTerm]) -> list[OfficialTerm]:
+    """A phrase governs its covered words; separately occurring words still apply."""
+    spans: dict[str, list[tuple[int, int]]] = {}
+    for term in terms:
+        pattern = re.escape(term.source)
+        if _LATIN_TERM_RE.fullmatch(term.source):
+            pattern = rf"(?<![A-Za-z0-9_]){pattern}(?![A-Za-z0-9_])"
+        spans[term.source] = [match.span() for match in re.finditer(pattern, source)]
+    kept = []
+    for term in terms:
+        larger = [span for other in terms if len(other.source) > len(term.source) for span in spans[other.source]]
+        if any(not any(left <= start and end <= right for left, right in larger) for start, end in spans[term.source]):
+            kept.append(term)
+    return kept

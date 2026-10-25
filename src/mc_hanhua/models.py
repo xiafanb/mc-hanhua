@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -44,6 +45,9 @@ FAILURE_REASON_LABELS = {
     "newline_structure": "换行结构被破坏",
     "unexpected_error": "未分类错误",
     "meta_response": "模型元回复穿漏",
+    "model_scaffolding": "译文含模型输出标记",
+    "instruction_negation": "操作指令否定词丢失",
+    "puzzle_content": "谜题文本需要保留",
     "cross_id_mismatch": "批翻译 ID 交叉错位",
     "official_term_conflict": "官方术语冲突",
 }
@@ -74,6 +78,14 @@ class TextUnit:
     # Never inferred from source text alone when multiple objects share a word.
     object_key: str = ""
     canonical_key: str = ""
+
+
+def structured_locator(unit: TextUnit) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(unit.locator)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 @dataclass(slots=True)
@@ -265,6 +277,11 @@ class TranslationReport:
     workspace_path: str = ""
     report_path: str = ""
     recoverable: bool = False
+    # Passage revisions (§3.12): adopted / rejected / rolled back, with reasons.
+    passage_revisions: list[dict[str, Any]] = field(default_factory=list)
+    # B v1.4 reflow (§3.13): enabled flag, map wrap width, proposals, refusals, adoptions.
+    passage_reflow: dict[str, Any] = field(default_factory=dict)
+    passage_sentence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

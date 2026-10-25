@@ -124,6 +124,7 @@ code, .mono { font-family: var(--mono); }
 .tb-actions { margin-left: auto; display: flex; gap: 4px; }
 .tb-actions button {
   width: 30px; height: 30px; display: grid; place-items: center;
+  padding: 0;
   border: 0; background: transparent; border-radius: var(--r-ctl);
   color: var(--ink-3); cursor: pointer;
 }

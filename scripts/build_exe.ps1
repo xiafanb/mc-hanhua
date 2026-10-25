@@ -32,6 +32,7 @@ $terms = Join-Path $assetDir "official-terms"
 $allowlist = Join-Path $assetDir "mechanism-allowlist.json"
 $displayAllowlist = Join-Path $assetDir "display-argument-allowlist.json"
 $fragmentAllowlist = Join-Path $assetDir "fragment-merge-allowlist.json"
+$glyphWidths = Join-Path $assetDir "glyph-widths.json"
 
 $bundle = if ($Mode -eq "onedir") { "--onedir" } else { "--onefile" }
 $pyiArgs = @(
@@ -55,6 +56,7 @@ $pyiArgs = @(
   "--add-data", "$allowlist;assets",
   "--add-data", "$displayAllowlist;assets",
   "--add-data", "$fragmentAllowlist;assets",
+  "--add-data", "$glyphWidths;assets",
   "--add-data", "$webui;src/mc_hanhua/webui",
   $entry
 )

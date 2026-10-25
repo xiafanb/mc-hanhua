@@ -402,11 +402,18 @@ def _extract_json_entries(
     filtered_details: list[dict[str, object]] | None = None,
     file_path: str = "",
     fragment_candidates: list[dict[str, object]] | None = None,
+    lenient: bool = False,
 ) -> list[tuple[dict[str, object], str]]:
     try:
         value = json.loads(raw)
     except json.JSONDecodeError:
-        return []
+        parsed = _lenient_json(raw) if lenient else None
+        if parsed is None:
+            return []
+        value = parsed[0]
+        # Unquoted-key components are written by span, never re-serialised.
+        return [item for item in _extract_json_entries(json.dumps(value), counts, filtered_details, file_path)
+                if item[0].get("kind") == "json"]
     if isinstance(value, str):
         # Bare JSON string literal ("...") as used by written-book pages and
         # sign lines: translate the decoded text and re-wrap on write-back.
@@ -560,8 +567,131 @@ def set_json_pointer(container: Any, pointer: str, value: str) -> None:
         cur[last] = value
 
 
+_LENIENT_BARE_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null")
+_LENIENT_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _lenient_json(raw: str) -> tuple[Any, dict[str, tuple[int, int]]] | None:
+    """Parse pre-1.12 Gson-lenient JSON (unquoted object keys).
+
+    Returns ``(tree, string_spans)`` where ``string_spans`` maps the JSON pointer
+    of every string value to its ``(start, end)`` literal span in ``raw`` so a
+    write can replace only that literal.  ``None`` on anything else.
+    """
+
+    n = len(raw)
+    spans: dict[str, tuple[int, int]] = {}
+    decoder = json.JSONDecoder()
+
+    def ws(i: int) -> int:
+        while i < n and raw[i] in " \t\r\n":
+            i += 1
+        return i
+
+    def string(i: int) -> tuple[str, int] | None:
+        try:
+            return decoder.raw_decode(raw, i)
+        except json.JSONDecodeError:
+            return None
+
+    def value(i: int, pointer: str) -> tuple[Any, int] | None:
+        i = ws(i)
+        if i >= n:
+            return None
+        ch = raw[i]
+        if ch == '"':
+            got = string(i)
+            if got is None:
+                return None
+            spans[pointer] = (i, got[1])
+            return got
+        if ch == "{":
+            out: dict[str, Any] = {}
+            i = ws(i + 1)
+            if i < n and raw[i] == "}":
+                return out, i + 1
+            while True:
+                i = ws(i)
+                if i < n and raw[i] == '"':
+                    got = string(i)
+                    if got is None:
+                        return None
+                    key, i = got
+                else:
+                    match = _LENIENT_KEY_RE.match(raw, i)
+                    if match is None:
+                        return None
+                    key, i = match.group(0), match.end()
+                i = ws(i)
+                if i >= n or raw[i] != ":":
+                    return None
+                got = value(i + 1, f"{pointer}/{escape_pointer_part(key)}")
+                if got is None:
+                    return None
+                out[key], i = got
+                i = ws(i)
+                if i < n and raw[i] == ",":
+                    i += 1
+                    continue
+                if i < n and raw[i] == "}":
+                    return out, i + 1
+                return None
+        if ch == "[":
+            items: list[Any] = []
+            i = ws(i + 1)
+            if i < n and raw[i] == "]":
+                return items, i + 1
+            while True:
+                got = value(i, f"{pointer}/{len(items)}")
+                if got is None:
+                    return None
+                item, i = got
+                items.append(item)
+                i = ws(i)
+                if i < n and raw[i] == ",":
+                    i += 1
+                    continue
+                if i < n and raw[i] == "]":
+                    return items, i + 1
+                return None
+        match = _LENIENT_BARE_RE.match(raw, i)
+        if match is None:
+            return None
+        return json.loads(match.group(0)), match.end()
+
+    start = ws(0)
+    if start >= n or raw[start] not in "{[":
+        return None
+    got = value(start, "")
+    if got is None or ws(got[1]) != n:
+        return None
+    return got[0], spans
+
+
+def _loads_component(raw: str) -> Any:
+    """Strict JSON, else lenient (unquoted-key) JSON; raises ``JSONDecodeError``."""
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = _lenient_json(raw)
+        if parsed is None:
+            raise
+        return parsed[0]
+
+
 def apply_json_text(raw: str, pointer: str, target: str) -> str:
-    value = json.loads(raw)
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = _lenient_json(raw)
+        if parsed is None:
+            raise
+        tree, spans = parsed
+        if _json_pointer_equals(tree, pointer, target) or pointer not in spans:
+            return raw
+        begin, end = spans[pointer]
+        return raw[:begin] + json.dumps(target, ensure_ascii=False) + raw[end:]
     if pointer == "" and isinstance(value, str):
         return raw if value == target else json.dumps(target, ensure_ascii=False)
     if _json_pointer_equals(value, pointer, target):
@@ -943,7 +1073,7 @@ def _resolve_snbt_span(command: str, locator: dict[str, object]) -> tuple[int, i
             raw_span = command[entry_start:entry_end]
             decoded = _snbt_unquote(raw_span) if entry_quoted else raw_span
             try:
-                get_json_pointer(json.loads(decoded), json_pointer)
+                get_json_pointer(_loads_component(decoded), json_pointer)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError, IndexError):
                 continue
             json_hits.append((entry_start, entry_end, entry_quoted, raw_span, decoded))
@@ -1161,7 +1291,7 @@ def read_command_text(command: str, locator: dict[str, object]) -> str | None:
                 nested = locator["json_command"]
                 return read_json_command_text(decoded, nested) if isinstance(nested, dict) else None
             if "json" in locator:
-                value = json.loads(decoded)
+                value = _loads_component(decoded)
                 found = get_json_pointer(value, str(locator["json"]))
                 return found if isinstance(found, str) else None
             return decoded
@@ -1291,6 +1421,9 @@ def _extract_match_snbt_texts(
     return []
 
 
+_BROKEN_COMPONENT_RE = re.compile(r'[{\[]\s*"?[A-Za-z_]\w*"?\s*:')
+
+
 def _extract_snbt_texts(
     command: str,
     counts: dict[str, int] | None = None,
@@ -1331,6 +1464,7 @@ def _extract_snbt_texts(
                 counts,
                 filtered_details=filtered_details,
                 file_path=file_path,
+                lenient=True,
             )
             if json_entries:
                 for entry, text in json_entries:
@@ -1354,10 +1488,24 @@ def _extract_snbt_texts(
             stripped = decoded.strip()
             if stripped.startswith(("{", "[", '"')):
                 try:
-                    json.loads(stripped)
+                    _loads_component(stripped)
                     continue
                 except json.JSONDecodeError:
                     pass
+            if _BROKEN_COMPONENT_RE.match(stripped):
+                # A page that opens a component but never parses: an unescaped
+                # quote ended the SNBT string, and 1.10's JsonToNBT then rejects
+                # the whole command, so no span of it is ever displayed.
+                _note_command_filter(
+                    counts,
+                    filtered_details,
+                    reason="unparsed_mechanism",
+                    file_path=file_path,
+                    path=path,
+                    source=decoded,
+                    extra_reason="unparseable component page; the game rejects this command",
+                )
+                continue
             if looks_translatable(decoded):
                 results.append(
                     (
@@ -1774,7 +1922,16 @@ def _parse_snbt(value: str) -> tuple[list[tuple[tuple[str, ...], int, int, bool]
                 values.append(parsed_value)
                 continue
         cursor += 1
-    return results, not failed, values
+    # A failed structure is rescanned from the next character, which re-reports
+    # spans already located with their full path. Keep the first (most
+    # specific) entry so no span is ever claimed twice.
+    seen_spans: set[tuple[int, int]] = set()
+    unique = []
+    for entry in results:
+        if (entry[1], entry[2]) not in seen_spans:
+            seen_spans.add((entry[1], entry[2]))
+            unique.append(entry)
+    return unique, not failed, values
 
 
 # Escapes ``_snbt_unquote`` resolves today, i.e. the spellings the writer is

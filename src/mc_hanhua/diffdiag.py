@@ -13,13 +13,12 @@ populated region.
 
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from .events import redact_text
-from .models import ScanResult, TextUnit
+from .models import ScanResult, TextUnit, structured_locator
 from .utils import looks_like_chinese_translation
 
 STRUCTURE_NAME_HINTS = ("/structure/", "/structures/", "generated/")
@@ -125,8 +124,4 @@ def diagnose_structure_conflicts(root: Path) -> list[dict[str, Any]]:
 
 
 def unit_locator_json(unit: TextUnit) -> dict[str, Any] | None:
-    try:
-        parsed = json.loads(unit.locator)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    return structured_locator(unit)

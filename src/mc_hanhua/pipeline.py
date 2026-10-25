@@ -27,6 +27,7 @@ from .events import (
     user_logs_disabled,
 )
 from .extractors import GenericJsonTextPlugin, JsonLangPlugin, LegacyLangPlugin, McfunctionPlugin, NbtTextPlugin
+from .font_overrides import scan_font_overrides
 from .glossary import Glossary
 from .memory import TranslationMemory
 from .mod_assets import ModAssetLibrary, default_mod_assets_root, sha256_file
@@ -486,6 +487,9 @@ def scan(
                 result.filtered_details.extend(details[:remaining])
         result.fragment_candidates.extend(getattr(plugin, "last_fragment_candidates", []) or [])
     result.mechanism_refs = mechanism_refs
+    from .content_safety import stamp_content_context
+
+    stamp_content_context(result.text_units)
     for unit in result.text_units:
         apply_unit_policy(unit)
     _lock_mechanism_function_arguments(result, input_fingerprint)
@@ -1437,6 +1441,8 @@ def _filter_excluded_units(units: list[TextUnit], excluded_paths: set[str]) -> l
 
 def _apply_seed_targets(units: list[TextUnit], seeds: SeedTranslations) -> None:
     for unit in units:
+        if unit.policy in {POLICY_IMMUTABLE_ID, POLICY_IMMUTABLE_MATCH, POLICY_UNKNOWN}:
+            continue
         target = seeds.get(_seed_key(unit.file_path, unit.format, unit.locator, unit.source_text))
         if target is not None:
             unit.final_target = _validated_candidate(unit, target, origin="seed")
@@ -1488,6 +1494,7 @@ def _apply_desktop_choices(
             from .quality import INTENTIONAL_KEEP
 
             unit.final_target = None
+            unit.metadata.pop("candidate_validation", None)
             unit.metadata[INTENTIONAL_KEEP] = {"reason": reviewed_reason, "origin": "reviewed_report"}
             unit.metadata["desktop_skip"] = True
 
@@ -1564,13 +1571,29 @@ def translate_units(
 
     if official_terms is not None and hasattr(translator, "official_terms"):
         translator.official_terms = official_terms
+    font_overrides = glossary.font_overrides
 
+    from .content_safety import stamp_content_context
+
+    protected_content = stamp_content_context(units)
+    for unit in units:
+        if unit.id in protected_content:
+            apply_unit_policy(unit)
     assign_canonical_keys(units)
+    from .passage_layout import PASSAGE_METADATA
+    from .passage_revisions import revalidate_groups
+
+    revalidate_groups(units, member_reason=lambda unit, target: "official_term_conflict" if _reuse_conflicts_official(unit, target, official_terms) else None)
     for unit in units:
         _check_cancel(cancel_event)
         if policy_blocks_canonical_share(unit):
             keep_original_target(unit)
             skipped += 1
+            continue
+        if unit.metadata.get(PASSAGE_METADATA):
+            # Bound passage member: checked as a whole above; the per-member
+            # line-shape repair must not rewrite the moved breaks.
+            reused += 1
             continue
         if unit.final_target is not None:
             candidate = _validated_candidate(unit, unit.final_target, origin="preset", official_terms=official_terms)
@@ -1580,6 +1603,10 @@ def translate_units(
                 continue
             unit.final_target = None
         if unit.policy and not should_send_to_ai(unit.policy) and unit.policy != POLICY_TRANSLATABLE:
+            keep_original_target(unit)
+            skipped += 1
+            continue
+        if font_overrides and font_overrides.only_icons(unit.source_text):
             keep_original_target(unit)
             skipped += 1
             continue
@@ -1596,6 +1623,8 @@ def translate_units(
         remembered = memory.get(unit.source_text, memory_context)
         if remembered is None:
             remembered = _lookup_book_locator_alias(memory, unit, memory_context)
+        if remembered is not None and font_overrides and font_overrides.new_in(unit.source_text, remembered):
+            remembered = None
         if remembered is not None and remembered == unit.source_text:
             # A failure fallback can persist "English -> English" rows (A07);
             # reusing them would make a re-run skip the retry forever.
@@ -2139,6 +2168,12 @@ def _record_consistency_conflict(
                 existing["samples"].append(sample)
 
 
+def _evict_unpublished_candidates(memory: TranslationMemory, units: list[TextUnit], *, blocked: bool) -> None:
+    for unit in units:
+        if blocked or unit.metadata.get("writeback_status") in {"blocked", "failed"}:
+            memory.delete(unit.source_text, quality_memory_context(unit))
+
+
 def write_translations(
     root: Path,
     units: list[TextUnit],
@@ -2148,7 +2183,11 @@ def write_translations(
 ) -> int:
     registry = registry or default_registry()
     grouped: dict[str, list[TextUnit]] = defaultdict(list)
+    from .passage_layout import PASSAGE_METADATA
+    from .passage_revisions import revalidate_groups
     from .references import unit_policy_name
+
+    revalidate_groups(units)
     for unit in units:
         if unit.final_target is not None:
             # Writers are an independent extension point; enforce the same
@@ -2167,6 +2206,8 @@ def write_translations(
                            extra={"origin": "writeback", "reason": reason})
                 unit.final_target = unit.source_text
                 continue
+            elif unit.metadata.get(PASSAGE_METADATA):
+                pass  # whole passage re-checked above and again by the writer against the input line
             elif unit.final_target != unit.source_text:
                 candidate = _validated_candidate(unit, unit.final_target, origin="writeback")
                 if candidate is None:
@@ -2413,10 +2454,12 @@ def _process_nested_archives(
                     registry=registry,
                     cancel_event=cancel_event,
                     official_terms_zh=_official_targets_by_key(official_terms),
+                    font_overrides=glossary.font_overrides,
                 )
             finally:
                 del nested_baseline
             blocked = bool(nested_audit.blocked)
+            _evict_unpublished_candidates(memory, scan_result.text_units, blocked=blocked)
             prefixed_details = _prefix_filtered_details(list(scan_result.filtered_details), archive_rel)
             _prefix_units(scan_result.text_units, archive_rel)
             all_units.extend(scan_result.text_units)
@@ -2629,6 +2672,15 @@ def _build_translation_report(
     )
 
 
+def _mark_chain_rollbacks(statuses: list[dict[str, object]], rolled: list[dict[str, object]]) -> None:
+    """Adopted records whose chain did not bind as a whole count as rejected."""
+
+    ids = {item["passage_id"] for item in rolled}
+    for status in statuses:
+        if status.get("status") == "adopted" and status.get("passage_id") in ids:
+            status.update(status="rejected", reason="chain_incomplete")
+
+
 def run_translation(
     input_path: Path,
     output_path: Path,
@@ -2648,6 +2700,10 @@ def run_translation(
     manual_targets: dict[str, str] | None = None,
     reviewed_keep_keys: ReviewedKeepKeys | None = None,
     translate_npc: bool = True,
+    passage_revisions: list[dict[str, object]] | None = None,
+    passage_reflow: bool = True,
+    passage_sentence: bool = False,
+    passage_names: Path | None = None,
     _preflight: bool = True,
     _write_failure_log: bool = True,
     task_root: Path | None = None,
@@ -2699,6 +2755,12 @@ def run_translation(
         official_index = _resolve_official_terms(official_terms, official_terms_dir, official_terms_version)
         if official_index is not None and hasattr(translator, "official_terms"):
             translator.official_terms = official_index
+        font_overrides = scan_font_overrides(working_root)
+        if font_overrides:
+            glossary.font_overrides = font_overrides
+            if hasattr(translator, "font_overrides"):
+                translator.font_overrides = font_overrides
+            _emit(progress_callback, "scan", f"资源包覆盖字体字符：{font_overrides.describe()}", 14, current_file=str(working_root))
         excluded_paths, asset_seeds, mod_coverage = _apply_mod_assets(working_root, library)
         combined_seeds = dict(asset_seeds)
         if seed_translations:
@@ -2714,6 +2776,26 @@ def run_translation(
             translate_npc=translate_npc,
             reviewed_keep_keys=reviewed_keep_keys,
         )
+        from .passage_revisions import adopt_passage_revisions, memory_records, stale_memory_ids
+
+        # B's remembered passages bind after translation (see below); with B
+        # switched off they are kept on disk and not used.
+        # D's likewise; with a provider switched off its passages are not used.
+        remembered, remembered_reflow, remembered_sentence = [], [], []
+        for item in memory_records(memory):
+            provider = item[1].get("provider")
+            (remembered_reflow if provider == "reflow" else remembered_sentence if str(provider).startswith("sentence") else remembered).append(item)
+        if not passage_reflow:
+            remembered_reflow = []
+        passage_inputs = [("manual", dict(record)) for record in (passage_revisions or [])] + remembered
+        passage_statuses = adopt_passage_revisions(
+            working_root,
+            scan_result.text_units,
+            passage_inputs,
+            member_reason=lambda unit, target: "official_term_conflict" if _reuse_conflicts_official(unit, target, official_index) else None,
+            blocked_keys=frozenset(manual_targets or {}),
+        )
+        stale_memory_ids(memory, passage_statuses, passage_inputs)
         progress.begin_scanned(len(scan_result.text_units))
         _emit(
             progress_callback,
@@ -2739,6 +2821,74 @@ def run_translation(
         )
         skipped += sum(bool(u.metadata.get("desktop_skip")) for u in scan_result.text_units)
         reused += sum(entry.keys_covered for entry in mod_coverage if entry.match_type == "full")
+        member_reason = lambda unit, target: "official_term_conflict" if _reuse_conflicts_official(unit, target, official_index) else None  # noqa: E731
+        sentence_stats: dict[str, object] = {"enabled": bool(passage_sentence)}
+        sentence_outcomes: list[dict[str, object]] = []
+        if passage_sentence:
+            # §3.14: D proposes whole-sentence translations for split passages
+            # of the root archive, after the per-component result (its fallback)
+            # and before B; the unified passage gate decides.
+            from .passage_sentence import load_name_config, propose_sentence_records, sentence_provider
+
+            names = load_name_config(passage_names) if passage_names else None
+            if names is not None and not names.applies_to(input_fingerprint):
+                raise ValueError(f"名称配置 {passage_names} 属于另一个输入版本，不能用于本任务。")
+            # A remembered D passage is only valid for the name config it was
+            # made with; any other one is forgotten and the passage re-proposed.
+            provider_tag = sentence_provider(names)
+            for _provider, record in remembered_sentence:
+                if record.get("provider") != provider_tag:
+                    memory.delete_passage(str(record.get("passage_id")))
+            remembered_sentence = [item for item in remembered_sentence if item[1].get("provider") == provider_tag]
+            from .passage_revisions import enforce_chains
+
+            remembered_statuses = adopt_passage_revisions(
+                working_root, scan_result.text_units, remembered_sentence, member_reason=member_reason, blocked_keys=frozenset(manual_targets or {})
+            )
+            # A chain binds whole or not at all; a partly remembered chain is forgotten.
+            _mark_chain_rollbacks(remembered_statuses, enforce_chains(scan_result.text_units))
+            stale_memory_ids(memory, remembered_statuses, remembered_sentence)
+            passage_statuses.extend(remembered_statuses)
+            sentence_records, sentence_stats, sentence_outcomes = propose_sentence_records(
+                working_root, scan_result.text_units, scan_result.commands, translator, glossary, names, memory,
+                font_overrides=font_overrides, blocked_keys=frozenset(manual_targets or {}),
+                budget=max_ai, max_workers=int(getattr(translator, "max_workers", 4) or 4),
+            )
+            sentence_statuses = adopt_passage_revisions(
+                working_root, scan_result.text_units, [(provider_tag, r) for r in sentence_records],
+                member_reason=member_reason, blocked_keys=frozenset(manual_targets or {}),
+            )
+            _mark_chain_rollbacks(sentence_statuses, enforce_chains(scan_result.text_units))
+            passage_statuses.extend(sentence_statuses)
+            sentence_stats = {**sentence_stats, "adopted": sum(s["status"] == "adopted" for s in sentence_statuses),
+                              "adopted_from_memory": sum(s["status"] == "adopted" for s in remembered_statuses)}
+        reflow_stats: dict[str, object] = {"enabled": bool(passage_reflow)}
+        if passage_reflow:
+            # §3.13: B proposes line-break moves for the final per-component
+            # targets of the root archive; the unified passage gate decides.
+            # Remembered B passages bind at this same point, never before
+            # translation, so a rerun sees the same consistency vote as the
+            # first run and units outside B's passages match B switched off.
+            from .passage_revisions import propose_reflow_records
+
+            remembered_statuses = adopt_passage_revisions(
+                working_root, scan_result.text_units, remembered_reflow, member_reason=member_reason, blocked_keys=frozenset(manual_targets or {})
+            )
+            stale_memory_ids(memory, remembered_statuses, remembered_reflow)
+            passage_statuses.extend(remembered_statuses)
+            reflow_records, proposed = propose_reflow_records(
+                working_root, scan_result.text_units, scan_result.commands, font_overrides=font_overrides
+            )
+            reflow_statuses = adopt_passage_revisions(
+                working_root,
+                scan_result.text_units,
+                [("reflow", record) for record in reflow_records],
+                member_reason=member_reason,
+                blocked_keys=frozenset(manual_targets or {}),
+            )
+            passage_statuses.extend(reflow_statuses)
+            reflow_stats.update(proposed, adopted=sum(s["status"] == "adopted" for s in reflow_statuses),
+                                adopted_from_memory=sum(s["status"] == "adopted" for s in remembered_statuses))
         progress.observe(scan_result.text_units)
         _emit(progress_callback, "write", "正在写入汉化文本", 76, progress, scanned=len(scan_result.text_units), translated=translated, reused=reused, skipped=skipped)
         # Audit root files before entering nested AI work. Each archive has its
@@ -2753,9 +2903,11 @@ def run_translation(
                 units=scan_result.text_units, registry=registry, cancel_event=cancel_event,
                 input_fingerprint=input_fingerprint,
                 official_terms_zh=_official_targets_by_key(official_index),
+                font_overrides=font_overrides,
             )
         finally:
             del baseline_snapshot
+        _evict_unpublished_candidates(memory, scan_result.text_units, blocked=audit_result.blocked)
         completed_groups = int(getattr(translator, "groups_completed", 0))
         remaining_ai = None if max_ai is None else max(0, max_ai - completed_groups)
         nested_units, nested_translated, nested_reused, nested_skipped, nested_warnings, nested_filtered_counts, nested_mod_coverage, nested_archive_results, nested_filtered_details, nested_blocked = _process_nested_archives(
@@ -2817,6 +2969,14 @@ def run_translation(
             mirror = output_event_log_path(working_root)
             event_log = str(event_sink.primary or mirror)
         blocked = bool(audit_result.blocked or nested_blocked)
+        from .passage_revisions import ROLLBACK_METADATA, store_published
+
+        store_published(memory, scan_result.text_units, blocked=blocked)
+        passage_statuses.extend(
+            {"status": "rolled_back", "file": unit.file_path, **unit.metadata[ROLLBACK_METADATA]}
+            for unit in scan_result.text_units
+            if isinstance(unit.metadata.get(ROLLBACK_METADATA), dict)
+        )
         publication_status = "withheld" if blocked else "published"
         report_dir = working_root / ".mc-hanhua"
         json_report_path = report_dir / "translation-report.json"
@@ -2848,6 +3008,9 @@ def run_translation(
             recoverable=blocked,
             progress=progress,
         )
+        report.passage_revisions = passage_statuses
+        report.passage_reflow = reflow_stats
+        report.passage_sentence = {**sentence_stats, "outcomes": sentence_outcomes}
         write_json_report(json_report_path, report, all_units)
         write_html_report(html_report_path, report, all_units)
         if task_root is not None:
@@ -3290,6 +3453,8 @@ def republish_from_workspace(
         result.status = "published"
         result.publication_status = "published"
     _preflight_output(output_root, output_archive)
+    if input_path.exists():
+        _preflight_output(input_path, output_archive)
     temp_archive = workspace / f"{output_archive.stem}.tmp{output_archive.suffix}"
     _emit(progress_callback, "pack", "正在压缩输出文件", 94)
     repack_directory(output_root, temp_archive, exclude_tool_metadata=True, cancel_event=cancel_event)

@@ -42,6 +42,10 @@ L  fixed divider layout: every rendered ``====`` row in a display command must
    remain an independent row with the same bytes and multiplicity, whether or
    not the command has a click event.  Lost, resized, or prose-glued dividers
    are errors; this parser is independent of the candidate-time layout rule.
+N  passage line breaks: when breaks moved between the plain-text components of
+   one tellraw passage (one member lost a break while another gained one), the
+   passage must keep its total, its fixed edges, no blank/divider rows and legal
+   break positions.  Rebuilt from the input and output lines only (§3.12).
 
 Known limits, reported instead of silently skipped: nested-archive spans (``!/``)
 are not re-read (the archive is repacked); call-site argument blocks are matched
@@ -60,7 +64,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .models import TextUnit
+from .models import TextUnit, structured_locator
 from .quality import COMMAND_RE, STRUCTURAL_TOKEN_PATTERNS, URL_RE, structural_tokens_match
 from .text_components import (
     _COMMAND_PAYLOAD_RE,
@@ -426,6 +430,7 @@ def _compare_command_line(
     issues.extend(_encoded_component_issues(rel, label, input_line, output_line, line_units))
     issues.extend(_fixed_divider_issues(rel, label, line_no, input_line, output_line))
     issues.extend(_interaction_issues(rel, label, line_no, input_line, output_line))
+    issues.extend(_passage_newline_issues(rel, label, line_no, input_line, output_line))
 
     masked_before = _masked_line(input_line, line_units)
     masked_after = _masked_line(output_line, line_units)
@@ -695,6 +700,177 @@ def _interaction_differences(before: tuple[_RenderedLeaf, ...], after: tuple[_Re
     return problems
 
 
+# Rule N (§3.12): passage line-break conservation, rebuilt from the input and
+# output lines only.  Deliberately its own implementation: it shares JSON syntax
+# helpers with the other rules but nothing with the writer's passage module.
+_N_CLICK_KEYS = ("clickEvent", "click_event")
+_N_NON_TEXT_KEYS = ("score", "selector", "nbt", "keybind", "translate", "extra")
+_N_STYLE_KEYS = ("color", "bold", "italic", "underlined", "strikethrough", "obfuscated", "font", "hoverEvent", "hover_event", "insertion")
+_N_BREAK = re.compile(r"[ \t]*\n[ \t]*")
+_N_INNER_FIXED = re.compile(r"\n[ \t]*\n|\n[ \t]*={3,}")
+_N_TAIL_DIVIDER = re.compile(r"\n[ \t]*={3,}[ \t]*$")
+_N_HAN = re.compile(r"[㐀-鿿豈-﫿]")
+_N_NO_START = set("，。！？；：、…）」』”’,.!?;:%")
+_N_NO_END = set("（「『“‘(")
+
+
+def _n_components(line: str) -> list | None:
+    if "tellraw" not in line:
+        return None
+    view = _command_payload_view(line)
+    if view is None:
+        return None
+    try:
+        tree: Any = json.loads(line[view[0]:])
+    except json.JSONDecodeError:
+        return None
+    return tree if isinstance(tree, list) else None
+
+
+def _n_edges(text: str) -> tuple[str, str]:
+    """Leading / trailing fixed edge of one component (only when it carries a break or a divider)."""
+
+    lead = re.match(r"\s*", text).group()
+    rest, trail = text[len(lead):], ""
+    while True:
+        tail = re.search(r"\s+$", rest)
+        if tail:
+            trail, rest = tail.group() + trail, rest[: tail.start()]
+        divider = _N_TAIL_DIVIDER.search(rest)
+        if not divider:
+            break
+        trail, rest = divider.group() + trail, rest[: divider.start()]
+    return (lead if "\n" in lead else ""), (trail if ("\n" in trail or "=" in trail) else "")
+
+
+def _n_passages(components: list) -> list[list[int]]:
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for index, component in enumerate(components):
+        plain = (isinstance(component, dict) and isinstance(component.get("text"), str)
+                 and not any(key in component for key in (*_N_CLICK_KEYS, *_N_NON_TEXT_KEYS)))
+        if not plain:
+            if current:
+                runs.append(current)
+            current = []
+            continue
+        lead, trail = _n_edges(component["text"])
+        if lead and current:
+            runs.append(current)
+            current = []
+        if component["text"].strip(" \t\n=") and component["text"][len(lead): len(component["text"]) - len(trail)].strip():
+            current.append(index)
+        if trail:
+            if current:
+                runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _n_shape(text: str) -> tuple:
+    """Row structure of one component: edge break counts, blank-row and divider-row indices."""
+
+    rows = text.split("\n")
+    lead = text[: len(text) - len(text.lstrip(" \t\n"))]
+    stripped = text.rstrip(" \t\n")
+    trail = text[len(stripped):] if stripped else ""
+    return (
+        lead.count("\n"),
+        trail.count("\n"),
+        tuple(i for i, row in enumerate(rows) if not row.strip() and 0 < i < len(rows) - 1),
+        tuple(i for i, row in enumerate(rows) if re.fullmatch(r"\s*={3,}\s*", row)),
+    )
+
+
+def _passage_newline_issues(rel: str, label: str, line_no: int, input_line: str, output_line: str) -> list[Any]:
+    """A passage whose breaks moved across components must conserve its layout."""
+
+    from .audit import AuditIssue
+
+    before = _n_components(input_line)
+    if before is None:
+        return []
+    after = _n_components(output_line)
+    if after is None or len(after) != len(before):
+        return []  # skeleton changes are rule P's finding
+    issues: list[Any] = []
+    for members in _n_passages(before):
+        texts_in = [before[i]["text"] for i in members]
+        texts_out = [after[i].get("text") if isinstance(after[i], dict) else None for i in members]
+        if not all(isinstance(text, str) for text in texts_out):
+            continue
+        counts_in = [text.count("\n") for text in texts_in]
+        counts_out = [text.count("\n") for text in texts_out]
+        moved = any(a < b for a, b in zip(counts_out, counts_in)) and any(a > b for a, b in zip(counts_out, counts_in))
+        if not moved:
+            # No break crossed a component.  The passage read as one text must keep
+            # its row structure: edge break counts and the positions of blank and
+            # divider rows.  Prose break positions are not judged here (per-component
+            # output legitimately places them anywhere), and whitespace-only members
+            # are reviewed fragment drops audited by the fragment rule.
+            # Only when every member kept its own break count: that is the case no
+            # other rule covers (a dropped break is the per-component path's own,
+            # long-standing tolerance, and dividers/buttons have rules L and I).
+            if texts_in != texts_out and counts_in == counts_out and _n_shape("".join(texts_in)) != _n_shape(
+                "".join(t if t.strip() or not s.strip() else s for s, t in zip(texts_in, texts_out))
+            ):
+                issues.append(
+                    AuditIssue(
+                        "error",
+                        "passage-layout",
+                        rel,
+                        f"{label}：段内换行结构被改写（首尾换行、空行或分隔线位置变化）",
+                        {"line": line_no + 1, "components": members},
+                    )
+                )
+            continue
+        problems: list[str] = []
+        if sum(counts_out) != sum(counts_in):
+            problems.append("段内换行总数改变")
+        stream: list[tuple[str, int]] = []
+        cuts: list[int] = []
+        for index, source, target in zip(members, texts_in, texts_out):
+            lead, trail = _n_edges(source)
+            if lead and not target.startswith(lead):
+                problems.append("成员开头的固定换行被改写")
+                continue
+            trail_match = re.search(r"[ \t]*" + re.escape(trail.lstrip(" \t")) + r"$", target) if trail else None
+            if trail and trail_match is None:
+                problems.append("成员结尾的固定行被改写")
+                continue
+            core = target[len(lead): trail_match.start() if trail_match else len(target)]
+            if _N_INNER_FIXED.search(core):
+                problems.append("段内出现空行或分隔线")
+            for piece_no, piece in enumerate(_N_BREAK.split(core)):
+                if piece_no:
+                    cuts.append(len(stream))
+                stream.extend((char, index) for char in piece)
+        style = {i: json.dumps({k: before[i].get(k) for k in _N_STYLE_KEYS}, sort_keys=True) for i in members}
+        for position in cuts:
+            if not 0 < position < len(stream) or cuts.count(position) > 1:
+                problems.append("段内出现空行")
+                continue
+            (a, owner_a), (b, owner_b) = stream[position - 1], stream[position]
+            same_style = owner_a == owner_b or style[owner_a] == style[owner_b]
+            if _N_HAN.match(a) and _N_HAN.match(b) and same_style:
+                problems.append(f"在两个汉字之间断行（{a}｜{b}）")
+            elif b in _N_NO_START or a in _N_NO_END:
+                problems.append(f"断行落在标点上（{a}｜{b}）")
+        if problems:
+            issues.append(
+                AuditIssue(
+                    "error",
+                    "passage-layout",
+                    rel,
+                    f"{label}：跨组件换行重排不守恒（{'；'.join(dict.fromkeys(problems))}）",
+                    {"line": line_no + 1, "components": members, "problems": problems},
+                )
+            )
+    return issues
+
+
 def _interaction_issues(rel: str, label: str, line_no: int, input_line: str, output_line: str) -> list[Any]:
     """Compare the interaction of a changed command line against its baseline.
 
@@ -810,11 +986,7 @@ def _declared_payload_pointers(units: list[TextUnit]) -> frozenset[str]:
 
 
 def _parsed_locator(unit: TextUnit) -> dict[str, Any]:
-    try:
-        locator = json.loads(unit.locator)
-    except (TypeError, ValueError):
-        return {}
-    return locator if isinstance(locator, dict) else {}
+    return structured_locator(unit) or {}
 
 
 def _encoded_component_issues(

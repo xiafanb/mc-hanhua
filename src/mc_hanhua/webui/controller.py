@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from mc_hanhua.archives import ARCHIVE_SUFFIXES
 from mc_hanhua.gui_support import _models_endpoint, _protect_text, _unprotect_text
+from mc_hanhua.map_version import default_output_path
 from mc_hanhua.models import (
     ArchiveResult,
     ProgressEvent,
@@ -93,9 +94,7 @@ def config_path() -> Path:
 
 
 def archive_output(path: Path) -> Path:
-    if path.suffix.lower() in ARCHIVE_SUFFIXES:
-        return path.with_name(f"{path.stem}_zh_cn{path.suffix}")
-    return path.with_name(f"{path.name}_zh_cn")
+    return default_output_path(path)
 
 
 def unique_output_path(path: Path) -> Path:
@@ -171,6 +170,9 @@ class TaskController:
         self.config = self.load_config()
         if "translate_npc" in self.config:
             self.translate_npc = bool(self.config.get("translate_npc"))
+        # D (DEVELOPMENT §3.14): off unless the user turns it on.
+        self.passage_sentence = bool(self.config.get("passage_sentence", False))
+        self.passage_names = str(self.config.get("passage_names") or "")
         self.api_key = ""
         self._key_unavailable = False
         self._credential_version = 0
@@ -264,6 +266,8 @@ class TaskController:
             "official_terms_dir": self.config.get("official_terms_dir", ""),
             "official_terms_version": self.config.get("official_terms_version", ""),
             "translate_npc": self.translate_npc,
+            "passage_sentence": self.passage_sentence,
+            "passage_names": self.passage_names,
             "auto_continue": self.auto_continue,
             "notify_system": self.notify_system_enabled(),
             "notify_sound": self.notify_sound_enabled(),
@@ -361,6 +365,39 @@ class TaskController:
             record["will_send_ai"] = record["editable"]
             record["tag"] = tag_for(str(record.get("policy") or ""), preference_keep=preference_keep)
         return self.snapshot(ok=True)
+
+    def set_passage_sentence(self, enabled: bool) -> dict[str, Any]:
+        previous = self.passage_sentence
+        self.passage_sentence = bool(enabled)
+        try:
+            self.save_config()
+        except Exception as exc:
+            self.passage_sentence = previous
+            return self._reject(f"偏好保存失败：{exc}")
+        return self.snapshot(ok=True)
+
+    def set_passage_names(self, path: str) -> dict[str, Any]:
+        """Map name config for D; ``""`` clears it.  The file must load as a name config."""
+
+        from mc_hanhua.passage_sentence import load_name_config
+
+        text = str(path or "").strip().strip('"')
+        if text:
+            try:
+                names = load_name_config(Path(text))
+            except (OSError, ValueError) as exc:
+                return self._reject(f"名称配置无法读取：{exc}")
+            label = f"名称配置已选择：{len(names.names)} 个名称"
+        else:
+            label = "已清除名称配置"
+        previous = self.passage_names
+        self.passage_names = text
+        try:
+            self.save_config()
+        except Exception as exc:
+            self.passage_names = previous
+            return self._reject(f"偏好保存失败：{exc}")
+        return self.snapshot(ok=True, toast=label)
 
     def resolve_fetch_credentials(self, payload: dict[str, Any] | None = None) -> tuple[str, str, str]:
         """Pick the key that belongs to the requested endpoint.
@@ -1018,10 +1055,24 @@ class TaskController:
             self.status_desc = f"输出：{report.output_path}" + (f"。{hint}。" if hint else "")
             self._remember_task("completed")
             self._log(f"完成：{report.output_path}" + (f" · {hint}" if hint else ""))
+            self._log_passage_sentence(report)
             notify_detail = " · ".join(part for part in (f"输出 {report.output_path.name}", unfinished_note(unfinished)) if part)
             notify = self._terminal_notify("complete", notify_detail, title=self.status_title if unfinished else "")
         self._accumulate_session()
         return self.snapshot(ok=True, notify=notify)
+
+    def _log_passage_sentence(self, report: TranslationReport) -> None:
+        stats = getattr(report, "passage_sentence", None) or {}
+        if not stats.get("enabled"):
+            return
+        if not stats.get("available", True):
+            self._log("整句翻译（D）未执行：当前模型不支持整句翻译，需要 Qwen-MT 专用翻译模型。", level="warn")
+            return
+        self._log(
+            f"整句翻译（D）：适用 {stats.get('passages_considered', 0)} 段，新采纳 {stats.get('adopted', 0)} 段，"
+            f"沿用 {stats.get('adopted_from_memory', 0)} 段；新请求 {stats.get('requests', 0)} 次，缓存命中 {stats.get('cache_hits', 0)} 次；"
+            f"名称配置 {stats.get('names', 0)} 个名称。未采纳的段保留逐组件译文。"
+        )
 
     def on_failed(self, message: str, log_path: str = "") -> dict[str, Any]:
         self.busy = False
@@ -1241,6 +1292,10 @@ class TaskController:
     def translation_options(self) -> dict[str, Any]:
         skip = npc_skip_keys(self.records, self.translate_npc)
         options: dict[str, Any] = {"skip_unit_keys": skip, "translate_npc": self.translate_npc}
+        if self.passage_sentence:
+            options["passage_sentence"] = True
+            if self.passage_names:
+                options["passage_names"] = Path(self.passage_names)
         if self.config.get("official_terms_dir"):
             options.update(
                 official_terms_dir=self.config["official_terms_dir"],
@@ -1299,6 +1354,12 @@ class TaskController:
             "prefs": {
                 "notify_system": self.notify_system_enabled(),
                 "notify_sound": self.notify_sound_enabled(),
+            },
+            "passage_sentence": {
+                "enabled": self.passage_sentence,
+                "names": self.passage_names,
+                # D needs a whole-text MT endpoint; with another provider it reports unavailable.
+                "ready": self.provider() == "qwen-mt",
             },
             "runtime_problems": self.runtime_problems[-RUNTIME_PROBLEM_SNAPSHOT_LIMIT:],
             "session": dict(self.session_totals),

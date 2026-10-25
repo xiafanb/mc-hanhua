@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -64,7 +65,70 @@ class TranslationMemory:
             )
             """
         )
+        self.conn.execute(
+            """
+            create table if not exists passage_memory (
+              namespace text not null,
+              passage_id text not null,
+              rule_version integer not null,
+              source_sha256 text not null,
+              members_json text not null,
+              provider text not null,
+              updated_at text not null default current_timestamp,
+              primary key (namespace, passage_id)
+            )
+            """
+        )
+        columns = {str(row[1]) for row in self.conn.execute("pragma table_info(passage_memory)").fetchall()}
+        if "chain" not in columns:
+            self.conn.execute("alter table passage_memory add column chain integer not null default 0")
         self.conn.commit()
+
+    def passage_records(self) -> list[dict[str, object]]:
+        """Every stored passage record of this input version (unvalidated)."""
+
+        with self._lock:
+            rows = self.conn.execute(
+                "select passage_id, rule_version, source_sha256, members_json, provider, chain from passage_memory where namespace = ?",
+                (self.namespace,),
+            ).fetchall()
+        records = []
+        for passage_id, rule_version, source_sha256, members_json, provider, chain in rows:
+            try:
+                members = json.loads(members_json)
+            except ValueError:
+                members = None
+            record = {"passage_id": str(passage_id), "rule_version": int(rule_version), "source_sha256": str(source_sha256),
+                      "members": members, "provider": str(provider)}
+            if chain:
+                record["chain"] = True
+            records.append(record)
+        return records
+
+    def put_passage(self, passage_id: str, rule_version: int, source_sha256: str, members: dict[str, str], provider: str,
+                    *, chain: bool = False) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                insert into passage_memory (namespace, passage_id, rule_version, source_sha256, members_json, provider, chain, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                on conflict(namespace, passage_id) do update set
+                  rule_version = excluded.rule_version,
+                  source_sha256 = excluded.source_sha256,
+                  members_json = excluded.members_json,
+                  provider = excluded.provider,
+                  chain = excluded.chain,
+                  updated_at = current_timestamp
+                """,
+                (self.namespace, passage_id, rule_version, source_sha256, json.dumps(members, ensure_ascii=False, sort_keys=True), provider,
+                 int(chain)),
+            )
+            self.conn.commit()
+
+    def delete_passage(self, passage_id: str) -> None:
+        with self._lock:
+            self.conn.execute("delete from passage_memory where namespace = ? and passage_id = ?", (self.namespace, passage_id))
+            self.conn.commit()
 
     def get(self, source: str, context: str = "", allow_source_fallback: bool = False) -> str | None:
         with self._lock:
@@ -102,3 +166,9 @@ class TranslationMemory:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+
+    def delete(self, source: str, context: str = "") -> None:
+        """Evict one refused candidate in this input namespace only."""
+        with self._lock:
+            self.conn.execute("delete from memory where namespace = ? and source = ? and context = ?", (self.namespace, source, context))
+            self.conn.commit()

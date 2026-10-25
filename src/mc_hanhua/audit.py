@@ -36,7 +36,7 @@ from .mechanism_skeleton import (
     json_skeleton,
     mentions_click_event,
 )
-from .models import ScanResult, TextUnit
+from .models import ScanResult, TextUnit, structured_locator
 from .nbt import (
     TAG_BYTE,
     TAG_BYTE_ARRAY,
@@ -55,7 +55,7 @@ from .nbt import (
     read_nbt_file,
     read_region_chunks,
 )
-from .policy import is_pure_numeric_or_enum_literal
+from .policy import is_pure_numeric_literal, is_pure_numeric_or_enum_literal
 from .quality import clue_token_drift, container_display_risk
 from .text_components import composed_pointer, escape_pointer_part, split_encoded_component_locator
 from .utils import UNREADABLE_TEXT_ERRORS, is_os_metadata_path, read_text
@@ -324,7 +324,9 @@ def _baseline_nbt_tag(baseline: AuditBaseline, unit: TextUnit, path: list[str | 
     rel = unit.file_path
     try:
         if rel.lower().endswith(".mca"):
-            locator = json.loads(unit.locator)
+            locator = structured_locator(unit)
+            if locator is None:
+                return None
             chunk_id = int(str(locator.get("chunk")))
             root = baseline.mca_chunk_docs.get((rel, chunk_id))
             if root is None:
@@ -347,6 +349,7 @@ def audit_output(
     cancel_event: Event | None = None,
     official_terms_zh: dict[str, str] | None = None,
     input_fingerprint: str = "",
+    font_overrides: Any = None,
 ) -> AuditResult:
     """Re-scan the output copy and run every read-only pre-publication check.
 
@@ -381,6 +384,9 @@ def audit_output(
     _audit_mechanism_refs(result, baseline_scan.mechanism_refs, rescan.mechanism_refs)
     _audit_unparsed_commands(result, baseline_scan.file_filtered)
     _audit_immutable_units(result, units, official_terms_zh=official_terms_zh)
+    if font_overrides:
+        _audit_font_glyphs(result, units, font_overrides)
+    _audit_display_content(result, root, baseline_scan.text_units)
     resources = _collect_pack_resources(root)
     result.issues.extend(audit_resources(rescan.commands, resources))
     result.issues.extend(audit_books(units))
@@ -408,6 +414,51 @@ def audit_output(
             files=baseline.interaction_lines_skipped,
         )
     return result
+
+
+def _audit_font_glyphs(result: AuditResult, units: list[TextUnit], font: Any) -> None:
+    for unit in units:
+        target = unit.final_target
+        if not target or target == unit.source_text:
+            continue
+        clash = font.new_in(unit.source_text, target)
+        if clash:
+            shown = "".join(sorted(clash))
+            result.issue(
+                "warning",
+                "font-glyph",
+                unit.file_path,
+                f"译文含被资源包重绘为图标的字符，游戏内可能显示为图标：{shown}",
+                locator=unit.locator,
+                chars=shown,
+            )
+
+
+def _audit_display_content(result: AuditResult, root: Path, originals: list[TextUnit]) -> None:
+    """Reclassify source containers and inspect actual output, not candidate flags."""
+    from .content_safety import candidate_content_reason, suspected_cipher_units
+    from .extractors import LocatedTextReadError, read_located_text
+
+    protected = suspected_cipher_units(originals)
+    cache: dict[str, Any] = {}
+    current_file = None
+    for unit in sorted(originals, key=lambda item: item.file_path):
+        if "!/" in unit.file_path:
+            continue  # Each nested package has its own original baseline.
+        if current_file != unit.file_path:
+            cache.clear()
+            current_file = unit.file_path
+        try:
+            actual = read_located_text(root, unit, cache=cache)
+        except LocatedTextReadError as exc:
+            if unit.id in protected:
+                result.issue("error", "content", unit.file_path, "无法核对疑似密码原文", locator=unit.locator, reason=exc.reason)
+            continue  # Parseability and located-writeback have their own gates.
+        if actual == unit.source_text:
+            continue
+        reason = "puzzle_content" if unit.id in protected else candidate_content_reason(unit.source_text, actual)
+        if reason:
+            result.issue("error", "content", unit.file_path, "显示文本未通过内容安全复验", locator=unit.locator, reason=reason)
 
 
 def _iter_files(root: Path) -> list[Path]:
@@ -492,7 +543,15 @@ def _audit_immutable_units(
                 locator=unit.locator,
             )
             continue
-        if is_pure_numeric_or_enum_literal(unit.source_text) and unit.final_target != unit.source_text:
+        # Language-file values are always player-facing, so enum/boolean words
+        # (None/On/Off/true) may be translated there; only bare numbers stay locked.
+        is_lang = unit.format in {"json-lang", "legacy-lang"}
+        locked_literal = (
+            is_pure_numeric_literal(unit.source_text)
+            if is_lang
+            else is_pure_numeric_or_enum_literal(unit.source_text)
+        )
+        if locked_literal and unit.final_target != unit.source_text:
             if official_terms_zh is not None and official_terms_zh.get(unit.locator) == unit.final_target:
                 # The game's own translation of this value is what we produced:
                 # a legitimate localization, not a rewritten mechanism value.
@@ -750,9 +809,8 @@ def audit_resources(commands: list[tuple[str, str]], resources: PackResources | 
 def _book_unit_kind(unit: TextUnit) -> str | None:
     """Classify a unit as a book page: nbt | command | json | None."""
 
-    try:
-        locator = json.loads(unit.locator)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    locator = structured_locator(unit)
+    if locator is None:
         return None
     if unit.format == "nbt-text":
         path = locator.get("path")
@@ -844,9 +902,8 @@ def audit_books(units: list[TextUnit]) -> list[AuditIssue]:
 
 
 def _unit_nbt_path(unit: TextUnit) -> list[str | int] | None:
-    try:
-        locator = json.loads(unit.locator)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    locator = structured_locator(unit)
+    if locator is None:
         return None
     path = locator.get("path")
     return path if isinstance(path, list) else None
@@ -909,11 +966,10 @@ def _writable_container_keys(units: list[TextUnit]) -> dict[tuple[str, tuple[Any
 
     allowed: dict[tuple[str, tuple[Any, ...]], set[str]] = {}
     for unit in units:
-        if "!/" in unit.file_path:
+        if "!/" in unit.file_path or unit.format != "nbt-text":
             continue
-        try:
-            locator = json.loads(unit.locator)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        locator = structured_locator(unit)
+        if locator is None:
             continue
         path = locator.get("path")
         pointer = locator.get("json")
@@ -1003,7 +1059,9 @@ def _output_nbt_tag(root: Path, unit: TextUnit, path: list[str | int], cache: di
             if chunks is None:
                 chunks = read_region_chunks(file_path)
                 cache[unit.file_path] = chunks
-            locator = json.loads(unit.locator)
+            locator = structured_locator(unit)
+            if locator is None:
+                return None
             chunk_id = str(locator.get("chunk", ""))
             for chunk in chunks:
                 if str(chunk["index"]) == chunk_id:
@@ -1243,9 +1301,8 @@ def _writable_leaf_keys(units: list[TextUnit]) -> dict[str, set[str]]:
                 continue
             allowed.setdefault(unit.file_path, set()).add(unit.locator)
         elif unit.format == "nbt-text":
-            try:
-                locator = json.loads(unit.locator)
-            except (TypeError, ValueError, json.JSONDecodeError):
+            locator = structured_locator(unit)
+            if locator is None:
                 continue
             path = locator.get("path")
             if not isinstance(path, list):

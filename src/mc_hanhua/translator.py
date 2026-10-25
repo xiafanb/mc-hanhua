@@ -20,6 +20,7 @@ from .quality import (
     INTENTIONAL_KEEP,
     keepable_short_label,
     newline_rule,
+    normalize_candidate_scaffolding,
     passage_runs,
     repair_layout_candidate,
     restore_prose_line_shape,
@@ -29,8 +30,12 @@ from .utils import (
     PLACEHOLDER_RE,
     looks_like_chinese_translation,
     normalize_layout_newlines,
+    peel_text_edges,
     preserve_placeholders,
+    reattach_text_edges,
     restore_boundary_newlines,
+    restore_line_padding,
+    source_residue_fragments,
 )
 
 BatchProgressCallback = Callable[[int, int, int, str], None]
@@ -180,6 +185,10 @@ def _injectable_term(source: str, note: str) -> bool:
     return not (source == "End" and "dimension" in (note or "").lower())
 
 
+def _is_ascii_word_char(char: str) -> bool:
+    return char.isascii() and char.isalnum()
+
+
 def _locate_unique(text: str, needle: str) -> tuple[int, int] | None:
     """Span of the one occurrence of ``needle`` in ``text``, or ``None``.
 
@@ -196,9 +205,11 @@ def _locate_unique(text: str, needle: str) -> tuple[int, int] | None:
         return None
     end = start + len(needle)
     if needle.isascii():
-        if start and text[start - 1].isalnum():
+        # Only an ASCII word character extends a Latin word: 汉字 are
+        # ``isalnum()`` too, and "跟Impaz谈谈" must still locate "Impaz".
+        if start and _is_ascii_word_char(text[start - 1]):
             return None
-        if end < len(text) and text[end].isalnum():
+        if end < len(text) and _is_ascii_word_char(text[end]):
             return None
     return start, end
 
@@ -265,6 +276,23 @@ def strip_meta_response(source: str, text: str) -> str | None:
     if "只输出" in cleaned or cleaned.startswith(("译文：", "译文:", "翻译：", "翻译:")):
         return None
     return cleaned
+
+
+_ITEM_CONTEXT_RE = re.compile(r"(?i)(?:display|\b(?:custom_name|item_name|lore|name)\b)")
+_ITEM_COMMAND_RE = re.compile(r"^\s*/?(?:give|replaceitem|item|loot|summon|setblock|data)\b")
+_KEY_WORD_RE = re.compile(r"(?i)(?:(?<![a-z])|(?<=§[0-9a-fk-or]))(?:keys?|llaves?)(?![a-z])")
+NAME_RULE = "玩家名/作者名/用户名保持原文，不翻译不音译。"
+KEY_RULE = "物品名/描述中的 Key/Llave 指游戏物品，译为“钥匙”，不要译为密钥或键。"
+
+
+def item_key_hint(units: list[TextUnit]) -> str:
+    for unit in units:
+        if not _KEY_WORD_RE.search(unit.source_text):
+            continue
+        place = f"{unit.context} {unit.locator}"
+        if _ITEM_CONTEXT_RE.search(place) or _ITEM_COMMAND_RE.match(unit.source_text):
+            return KEY_RULE + "\n"
+    return ""
 
 
 def _has_cjk(text: str) -> bool:
@@ -378,6 +406,7 @@ class OpenAICompatibleTransport(TranslatorProvider):
         self.max_consecutive_rate_limits = 3
         self.max_consecutive_server_errors = max(1, int(os.getenv("MC_HANHUA_MAX_CONSECUTIVE_SERVER_ERRORS", "3")))
         self.official_terms = official_terms
+        self.font_overrides = None
         self.last_error = ""
         self.failure_counts: dict[str, int] = {}
         self.retry_counts: dict[str, int] = {}
@@ -489,6 +518,9 @@ class OpenAICompatibleTransport(TranslatorProvider):
         masked_source: str | None = None,
         term_map: dict[str, str] | None = None,
     ) -> tuple[str | None, str | None]:
+        if unit.metadata.get("content_preservation") and candidate != unit.source_text:
+            return None, "puzzle_content"
+        candidate = normalize_candidate_scaffolding(unit, candidate)
         validation_source = masked_source if masked_source is not None else unit.source_text
         masked_target = preserve_placeholders(validation_source, candidate)
         newline = newline_rule(unit)
@@ -519,6 +551,7 @@ class OpenAICompatibleTransport(TranslatorProvider):
             return None, "newline_structure"
         if not target:
             return None, "placeholder_mismatch"
+        target = restore_line_padding(unit.source_text, target)
         # Token layer, masked view: the reply must keep the tokens the model was
         # given.  The line shape is not compared here — it is compared against
         # the span itself below, and both views carry the same breaks.
@@ -545,6 +578,15 @@ class OpenAICompatibleTransport(TranslatorProvider):
             )
             if official_reason:
                 return None, official_reason
+        font = getattr(self, "font_overrides", None)
+        if font:
+            clash = font.new_in(unit.source_text, target)
+            if clash:
+                tries = int(unit.metadata.get("font_glyph_rejections", 0))
+                if tries < 2:
+                    unit.metadata["font_glyph_rejections"] = tries + 1
+                    return None, "font_glyph"
+                unit.metadata["font_glyph_warning"] = "".join(sorted(clash))
         if not looks_like_chinese_translation(target):
             if keepable_short_label(validation_source) and not _has_cjk(target):
                 # The provider keeps this label on purpose.  The pipeline will not
@@ -555,6 +597,9 @@ class OpenAICompatibleTransport(TranslatorProvider):
                 unit.metadata[INTENTIONAL_KEEP] = {"reason": "keepable_short_label", "origin": "model"}
                 return validation_source, None
             return None, "no_chinese_output" if not _has_cjk(target) else "low_quality"
+        residue = source_residue_fragments(unit.source_text, target)
+        if residue:
+            unit.metadata["source_residue_warning"] = ",".join(residue)
         return target, None
 
     def plan_requests(self, groups: list[TranslationGroup]) -> tuple[int, int]:
@@ -961,6 +1006,10 @@ class OpenAICompatibleTranslator(OpenAICompatibleTransport):
     supports_grouped_translation = True
     _FATAL_HTTP_CODES = {401: "API 密钥无效或未授权（401 Unauthorized）", 402: "API 余额不足或配额已用尽（402 Payment Required）", 403: "API 拒绝访问（403 Forbidden）"}
 
+    def _font_hint(self) -> str:
+        font = getattr(self, "font_overrides", None)
+        return font.prompt_hint() + "\n" if font else ""
+
     def _official_terms_block(self, source_text: str, unit: TextUnit | None = None, group: TranslationGroup | None = None) -> str:
         index = getattr(self, "official_terms", None)
         if index is None or not getattr(index, "available", False):
@@ -999,11 +1048,11 @@ class OpenAICompatibleTranslator(OpenAICompatibleTransport):
         official_clause = f"。{official_hint}" if official_hint else ""
         prompt = (
             "把以下 Minecraft 文本翻译成简体中文，只输出译文，不要解释"
-            f"{term_hint}{official_clause}。保留占位符、§颜色代码和\\n：{masked}"
+            f"{term_hint}{official_clause}。{NAME_RULE}{item_key_hint([unit]).strip()}保留占位符、§颜色代码和\\n：{masked}"
         )
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": self._font_hint() + prompt}],
             "temperature": 0,
         }
         try:
@@ -1194,6 +1243,12 @@ class OpenAICompatibleTranslator(OpenAICompatibleTransport):
         ))
         if contexts:
             segment_lines.insert(0, "以下为只读相邻页上下文（含已有中文，不作为额外输出段落）：\n" + "\n".join(contexts)[:12000])
+        display_contexts = list(dict.fromkeys(
+            str(unit.metadata["display_reading_context"])
+            for unit in group.units if unit.metadata.get("display_reading_context")
+        ))
+        if display_contexts:
+            segment_lines.insert(0, "以下为只读完整显示文本，供理解语序；只翻译下列编号片段，勿重复输出全文：\n" + "\n".join(display_contexts)[:12000])
         term_hits = [f"{entry.source}=>{entry.target}" for entry in glossary.entries if any(entry.source.lower() in unit.source_text.lower() for unit in group.units)][:16]
         terms = "；".join(term_hits) or "无"
         official_block = self._official_terms_block(" ".join(unit.source_text for unit in group.units), group=group)
@@ -1202,6 +1257,8 @@ class OpenAICompatibleTranslator(OpenAICompatibleTransport):
             official_line += "本组为同一本书，片段可能跨页续句。先通读全组，再逐段输出；保留全部条件、动作、对象、编号与跳转，不将续句误作独立句，不漏译。品牌名按上下文保持一致。\n"
         task = "审校并改写草稿" if review else "翻译"
         repair_hint = "上一轮输出不符合标记格式；请重新输出完整译文。\n" if repair else ""
+        if repair and getattr(self, "font_overrides", None):
+            repair_hint += "尤其检查：上一轮译文可能用了被资源包重绘为图标的汉字，请换同义词。\n"
         passage_hint = (
             "带（同一段连续文本）标记的片段是同一条语句被排版拆开的连续行：先连读理解整句，再按自然中文语序切回同样多的行，"
             "逐行返回；不要逐行孤立翻译，也不要合并或增删行数。\n"
@@ -1220,7 +1277,11 @@ class OpenAICompatibleTranslator(OpenAICompatibleTransport):
             f"Minecraft 简体中文本地化：{task}以下{group.container_type}片段。\n"
             + (f"术语：{terms}\n" if term_hits else "")
             + official_line
-            + "按片段阅读顺序理解上下文；保留占位符、§颜色码、URL、命令、换行语义，不增删事实。\n"
+            + self._font_hint()
+            + "按片段阅读顺序理解上下文；保留占位符、§颜色码、URL、命令、换行语义，不增删事实。"
+            + NAME_RULE
+            + "\n"
+            + item_key_hint(group.units)
             + layout_hint
             + passage_hint
             + "仅输出 @@序号@@译文，不要解释或 Markdown。\n"
@@ -1372,9 +1433,13 @@ class OpenAICompatibleTranslator(OpenAICompatibleTransport):
             official_line = f"{official_block}\n" if official_block else ""
             prompt = (
                 "你是 Minecraft Java 整合包的中文本地化编辑。以下是同一文本块，翻译其中指定片段为自然简体中文。"
-                "保留占位符、§颜色码、URL、命令和换行；不得添加原文没有的信息。\n"
-                f"文件：{group.file_path}\n位置：{group.context}\n"
+                "保留占位符、§颜色码、URL、命令和换行；不得添加原文没有的信息。"
+                + NAME_RULE
+                + "\n"
+                + item_key_hint([unit])
+                + f"文件：{group.file_path}\n位置：{group.context}\n"
                 + official_line
+                + self._font_hint()
                 + f"完整文本块：\n{context}\n\n"
                 f"只输出第 {index} 段的译文：{masked}"
             )
@@ -1695,7 +1760,10 @@ class QwenMTTranslator(OpenAICompatibleTransport):
             self._record_failure("missing_api_key", "OPENAI_API_KEY is empty")
             return None
         source_text = unit.source_text
-        reply = self._request_mt_text(source_text, glossary, unit=unit, group=group, timeout=60)
+        leading, core, trailing = ("", source_text, "")
+        if not (group is not None and group.layout_reflow) and not newline_rule(unit).repair:
+            leading, core, trailing = peel_text_edges(source_text)
+        reply = self._request_mt_text(core, glossary, unit=unit, group=group, timeout=60)
         if reply is None:
             unit.metadata["translation_status"] = "request_failed"
             with self._state_lock:
@@ -1703,6 +1771,8 @@ class QwenMTTranslator(OpenAICompatibleTransport):
             self._emit_result(unit, group, "draft", submitted=source_text, target=None, status="request_failed", reason=self.last_error.split(":", 1)[0])
             return None
         content, terms = reply
+        if leading or trailing:
+            content = reattach_text_edges(leading, trailing, content)
         # No masked_source/term_map: lexical glossary masking belongs to the
         # chat provider. Injection happened through the native terms array.
         target, reason = self._finish_candidate(unit, content, layout_reflow=bool(group.layout_reflow) if group is not None else False)
